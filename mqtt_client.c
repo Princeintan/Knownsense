@@ -1,0 +1,168 @@
+#include "mqtt_client.h"
+#include "pico/cyw43_arch.h"
+#include "hardware/adc.h"
+#include "lwip/apps/mqtt_priv.h"
+#include "lwip/dns.h"
+#include <string.h>
+#include <stdio.h>
+
+#define INFO_printf printf
+#define ERROR_printf printf
+
+#define MQTT_SUBSCRIBE_QOS 1
+#define MQTT_PUBLISH_QOS 1
+#define MQTT_PUBLISH_RETAIN 0
+
+#define TEMP_PUBLISH_INTERVAL_MS 10000
+#define MQTT_KEEP_ALIVE_S 60
+
+#ifndef TEMPERATURE_UNITS
+#define TEMPERATURE_UNITS 'C'
+#endif
+
+static float read_onboard_temperature(char unit)
+{
+    const float conversionFactor = 3.3f / (1 << 12);
+    float adc = (float)adc_read() * conversionFactor;
+    float tempC = 27.0f - (adc - 0.706f) / 0.001721f;
+    return (unit == 'F') ? (tempC * 9 / 5 + 32) : tempC;
+}
+
+static void pub_request_cb(void *arg, err_t err)
+{
+    if (err != 0)
+        ERROR_printf("Publish error %d\n", err);
+}
+
+static void mqtt_incoming_publish_cb(void *arg, const char *topic, u32_t tot_len)
+{
+    MQTT_CLIENT_DATA_T *state = (MQTT_CLIENT_DATA_T *)arg;
+    strncpy(state->topic, topic, sizeof(state->topic));
+}
+
+static void mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
+{
+    MQTT_CLIENT_DATA_T *state = (MQTT_CLIENT_DATA_T *)arg;
+    // Copy payload safely
+    strncpy(state->data, (const char *)data, len);
+    state->data[len] = '\0';
+
+    // Extract only the last part of the topic (e.g. "cmd" or "log")
+    const char *topic = state->topic;
+    const char *last_slash = strrchr(topic, '/');
+    const char *topic_tail = last_slash ? last_slash + 1 : topic; // after last '/'
+
+    INFO_printf("Message on %s (type: %s): %s\n", topic, topic_tail, state->data);
+
+    // Trigger user callback with the simplified topic name
+    if (state->on_message)
+        state->on_message(topic_tail, state->data);
+}
+
+static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection_status_t status)
+{
+    MQTT_CLIENT_DATA_T *state = (MQTT_CLIENT_DATA_T *)arg;
+    if (status == MQTT_CONNECT_ACCEPTED)
+    {
+        state->connect_done = true;
+        INFO_printf("MQTT connected\n");
+
+        const char *topics[] = {"/log", "/cmd"};
+        char topic_with_id[32];
+
+        // Subscribe to both client-specific and broadcast topics
+        for (int i = 0; i < 2; i++)
+        {
+            // ---- Client-specific topics ----
+            snprintf(topic_with_id, sizeof(topic_with_id), "/%s%s",
+                     state->mqtt_client_info.client_id, topics[i]);
+
+            err_t err = mqtt_sub_unsub(client, topic_with_id, MQTT_SUBSCRIBE_QOS, NULL, state, 1);
+            if (err == ERR_OK)
+                INFO_printf("Subscribed to %s\n", topic_with_id);
+            else
+                ERROR_printf("Subscribe failed for %s: %d\n", topic_with_id, err);
+
+            // ---- Broadcast topics ----
+            snprintf(topic_with_id, sizeof(topic_with_id), "/all%s", topics[i]);
+            err = mqtt_sub_unsub(client, topic_with_id, MQTT_SUBSCRIBE_QOS, NULL, state, 1);
+            if (err == ERR_OK)
+                INFO_printf("Subscribed to %s\n", topic_with_id);
+            else
+                ERROR_printf("Subscribe failed for %s: %d\n", topic_with_id, err);
+        }
+    }
+    else
+    {
+        ERROR_printf("MQTT connect failed: %d\n", status);
+    }
+}
+
+static void start_client(MQTT_CLIENT_DATA_T *state)
+{
+    const int port = MQTT_PORT;
+    state->mqtt_client_inst = mqtt_client_new();
+    if (!state->mqtt_client_inst)
+        panic("MQTT client creation failed");
+
+    cyw43_arch_lwip_begin();
+    mqtt_client_connect(state->mqtt_client_inst, &state->mqtt_server_address,
+                        port, mqtt_connection_cb, state, &state->mqtt_client_info);
+    mqtt_set_inpub_callback(state->mqtt_client_inst, mqtt_incoming_publish_cb, mqtt_incoming_data_cb, state);
+    cyw43_arch_lwip_end();
+}
+
+static void dns_found(const char *hostname, const ip_addr_t *ipaddr, void *arg)
+{
+    MQTT_CLIENT_DATA_T *state = (MQTT_CLIENT_DATA_T *)arg;
+    if (ipaddr)
+    {
+        state->mqtt_server_address = *ipaddr;
+        start_client(state);
+    }
+    else
+    {
+        ERROR_printf("DNS failed for %s\n", hostname);
+    }
+}
+
+void mqtt_client_init(MQTT_CLIENT_DATA_T *state, const char *client_id)
+{
+    memset(state, 0, sizeof(MQTT_CLIENT_DATA_T));
+    state->mqtt_client_info.client_id = client_id;
+    state->mqtt_client_info.keep_alive = MQTT_KEEP_ALIVE_S;
+}
+
+void mqtt_client_start(MQTT_CLIENT_DATA_T *state)
+{
+    cyw43_arch_lwip_begin();
+    int err = dns_gethostbyname(MQTT_SERVER, &state->mqtt_server_address, dns_found, state);
+    cyw43_arch_lwip_end();
+    if (err == ERR_OK)
+        start_client(state);
+    else if (err != ERR_INPROGRESS)
+        ERROR_printf("DNS lookup failed\n");
+}
+
+void mqtt_client_publish_temperature(MQTT_CLIENT_DATA_T *state)
+{
+    float temp = read_onboard_temperature(TEMPERATURE_UNITS);
+    char msg[32];
+    snprintf(msg, sizeof(msg), "%.2f", temp);
+    mqtt_publish(state->mqtt_client_inst, "/temperature", msg, strlen(msg),
+                 MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
+}
+
+void mqtt_client_publish_resistance(MQTT_CLIENT_DATA_T *state, char msg[128])
+{
+    char topic[32];
+    snprintf(topic, sizeof(topic), "/%s/resistance", state->mqtt_client_info.client_id);
+
+    mqtt_publish(state->mqtt_client_inst, topic, msg, strlen(msg),
+                 MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
+}
+
+void mqtt_client_stop(MQTT_CLIENT_DATA_T *state)
+{
+    mqtt_disconnect(state->mqtt_client_inst);
+}
