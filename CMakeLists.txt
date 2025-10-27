@@ -32,8 +32,7 @@ set(PICO_BOARD pico2_w CACHE STRING "Board type")
 include(pico_sdk_import.cmake)
 
 project(knownsense4 C CXX ASM)
-
-set(MQTT_SERVER "192.168.62.250")
+set(MQTT_SERVER "192.168.61.57")
 set(WIFI_SSID "IISERTVM")
 set(WIFI_PASSWORD "iisertvmwlan")
 
@@ -84,6 +83,14 @@ add_executable(knownsense4
     mqtt_client.c
 )
 
+if(COMMAND pico_set_stack_size)
+    pico_set_stack_size(knownsense4 0x4000)
+else()
+    # Fallback: define the __stack_size symbol for the linker if pico_set_stack_size is not available
+    # Use linker defsym to set the stack size for GCC toolchains
+    target_link_options(knownsense4 PRIVATE "-Wl,--defsym=__stack_size=0x4000")
+endif()
+
 pico_set_program_name(knownsense4 "knownsense4")
 pico_set_program_version(knownsense4 "0.1")
 
@@ -96,7 +103,8 @@ target_link_libraries(knownsense4
     pico_cyw43_arch_lwip_threadsafe_background
     pico_lwip_mqtt
     pico_mbedtls
-    pico_lwip_mbedtls)
+    pico_lwip_mbedtls
+)
 
 # Add the standard include files to the build
 target_include_directories(knownsense4 PRIVATE

@@ -1,17 +1,10 @@
-// mqtt_client.c  (patched)
 #include "mqtt_client.h"
 #include "pico/cyw43_arch.h"
 #include "hardware/adc.h"
-#include "lwip/apps/mqtt.h"
+#include "lwip/apps/mqtt_priv.h"
 #include "lwip/dns.h"
 #include <string.h>
 #include <stdio.h>
-#include <stdint.h>
-
-#include "lwip/mem.h"
-#include "lwip/timeouts.h" // gives you sys_check_timeouts()
-#include "lwip/stats.h"
-
 volatile bool mqtt_connected = false; // Global MQTT connection flag
 
 #define INFO_printf printf
@@ -28,12 +21,6 @@ volatile bool mqtt_connected = false; // Global MQTT connection flag
 #define TEMPERATURE_UNITS 'C'
 #endif
 
-// ---- publish flow control ----
-// Maximum number of outstanding publishes waiting for confirmation.
-// Tune this between 2..8 depending on network/broker performance.
-#define MQTT_MAX_INFLIGHT 4
-static volatile int mqtt_inflight_count = 0;
-
 static float read_onboard_temperature(char unit)
 {
     const float conversionFactor = 3.3f / (1 << 12);
@@ -46,36 +33,20 @@ static void pub_request_cb(void *arg, err_t err)
 {
     if (err != 0)
         ERROR_printf("Publish error %d\n", err);
-
-    // Safely decrement inflight counter (don't go below 0)
-    if (mqtt_inflight_count > 0)
-        mqtt_inflight_count--;
 }
 
 static void mqtt_incoming_publish_cb(void *arg, const char *topic, u32_t tot_len)
 {
     MQTT_CLIENT_DATA_T *state = (MQTT_CLIENT_DATA_T *)arg;
-    if (!state)
-        return;
-
-    // Safe copy of topic into state->topic (ensures NUL termination)
-    size_t tlen = strlen(topic);
-    size_t tc = (tlen < sizeof(state->topic) - 1) ? tlen : (sizeof(state->topic) - 1);
-    memcpy(state->topic, topic, tc);
-    state->topic[tc] = '\0';
+    strncpy(state->topic, topic, sizeof(state->topic));
 }
 
 static void mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
 {
     MQTT_CLIENT_DATA_T *state = (MQTT_CLIENT_DATA_T *)arg;
-    if (!state)
-        return;
-
-    // Safe copy for incoming payload: copy up to size-1 and NUL terminate
-    size_t copy_len = (len < sizeof(state->data) - 1) ? len : (sizeof(state->data) - 1);
-    if (copy_len > 0)
-        memcpy(state->data, data, copy_len);
-    state->data[copy_len] = '\0';
+    // Copy payload safely
+    strncpy(state->data, (const char *)data, len);
+    state->data[len] = '\0';
 
     // Extract only the last part of the topic (e.g. "cmd" or "log")
     const char *topic = state->topic;
@@ -92,9 +63,6 @@ static void mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t f
 static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection_status_t status)
 {
     MQTT_CLIENT_DATA_T *state = (MQTT_CLIENT_DATA_T *)arg;
-    if (!state)
-        return;
-
     if (status == MQTT_CONNECT_ACCEPTED)
     {
         state->connect_done = true;
@@ -102,13 +70,12 @@ static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection
         INFO_printf("MQTT connected\n");
 
         const char *topics[] = {"/log", "/cmd"};
-        char topic_with_id[48];
+        char topic_with_id[32];
 
         // Subscribe to both client-specific and broadcast topics
         for (int i = 0; i < 2; i++)
         {
             // ---- Client-specific topics ----
-            // Protect snprintf size
             snprintf(topic_with_id, sizeof(topic_with_id), "/%s%s",
                      state->mqtt_client_info.client_id, topics[i]);
 
@@ -185,73 +152,17 @@ void mqtt_client_publish_temperature(MQTT_CLIENT_DATA_T *state)
     float temp = read_onboard_temperature(TEMPERATURE_UNITS);
     char msg[32];
     snprintf(msg, sizeof(msg), "%.2f", temp);
-
-    // Check inflight limit
-    if (mqtt_inflight_count >= MQTT_MAX_INFLIGHT)
-    {
-        INFO_printf("MQTT temp publish skipped, inflight=%d\n", mqtt_inflight_count);
-        return;
-    }
-
-    err_t err = mqtt_publish(state->mqtt_client_inst, "/temperature", msg, strlen(msg),
-                             MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
-    if (err == ERR_OK)
-        mqtt_inflight_count++;
-    else
-        ERROR_printf("mqtt_publish (temp) returned %d\n", err);
+    mqtt_publish(state->mqtt_client_inst, "/temperature", msg, strlen(msg),
+                 MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
 }
 
 void mqtt_client_publish_resistance(MQTT_CLIENT_DATA_T *state, char msg[128])
 {
-    if (!state || !state->mqtt_client_inst)
-        return;
-
-    // Flow control: don't exceed inflight limit
-    if (mqtt_inflight_count >= MQTT_MAX_INFLIGHT)
-    {
-        INFO_printf("MQTT resistance publish skipped, inflight=%d\n", mqtt_inflight_count);
-        return;
-    }
-
-    char topic[48];
+    char topic[32];
     snprintf(topic, sizeof(topic), "/%s/resistance", state->mqtt_client_info.client_id);
 
-    err_t err = mqtt_publish(state->mqtt_client_inst, topic, msg, strlen(msg),
-                             MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
-    if (err == ERR_OK)
-    {
-        mqtt_inflight_count++;
-    }
-    else
-    {
-        ERROR_printf("mqtt_publish (resistance) returned %d\n", err);
-    }
-}
-void mqtt_client_publish_resistance_safe(MQTT_CLIENT_DATA_T *state, const char *msg)
-{
-    if (!mqtt_client_isconnected(state))
-    {
-        // Not connected — skip publish
-        return;
-    }
-
-    // Avoid accessing mqtt_client_s internals (opaque type); use inflight counter as a heuristic
-    if (mqtt_inflight_count >= MQTT_MAX_INFLIGHT)
-    {
-        printf("[MQTT] Skipping publish, inflight=%d\n", mqtt_inflight_count);
-        return;
-    }
-
-    char topic[48];
-    snprintf(topic, sizeof(topic), "/%s/resistance", state->mqtt_client_info.client_id);
-
-    err_t err = mqtt_publish(state->mqtt_client_inst, topic, msg, strlen(msg),
-                             MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, NULL, state);
-
-    if (err != ERR_OK)
-    {
-        printf("[MQTT] Publish failed (err=%d)\n", err);
-    }
+    mqtt_publish(state->mqtt_client_inst, topic, msg, strlen(msg),
+                 MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
 }
 
 void mqtt_client_stop(MQTT_CLIENT_DATA_T *state)
@@ -264,21 +175,4 @@ bool mqtt_client_isconnected(MQTT_CLIENT_DATA_T *state)
     if (!state || !state->mqtt_client_inst)
         return false;
     return mqtt_client_is_connected(state->mqtt_client_inst);
-}
-
-// Called every ~10 seconds from your main loop
-
-void mqtt_client_maintenance(MQTT_CLIENT_DATA_T *state)
-{
-    // Run periodic housekeeping to keep lwIP and MQTT responsive
-    cyw43_arch_lwip_begin();
-    sys_check_timeouts(); // cleans up lwIP timers and pending timeouts
-    cyw43_arch_lwip_end();
-
-    // Optionally, reconnect if disconnected
-    if (state && !mqtt_client_isconnected(state) && state->connect_done)
-    {
-        printf("[MQTT] Lost connection, attempting reconnect...\n");
-        mqtt_client_start(state);
-    }
 }

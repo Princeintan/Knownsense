@@ -8,8 +8,29 @@
 #include "pico/cyw43_arch.h"
 #include "mqtt_client.h"
 
+//---- led init and timer ----
+#define LED_PIN CYW43_WL_GPIO_LED_PIN // Built-in LED on Pico W / Pico 2 W
+
+extern volatile bool mqtt_connected; // from mqtt_client.c
+
+typedef enum
+{
+    LED_BOOT,
+    LED_WIFI_CONNECTING,
+    LED_MQTT_CONNECTING,
+    LED_CONNECTED,
+    LED_LOGGING
+} led_state_t;
+
+static led_state_t current_led_state = LED_BOOT;
+static led_state_t last_led_state = -1; // to detect state changes
+static repeating_timer_t led_timer;
+
 // ---------- Config / Globals ----------
 MQTT_CLIENT_DATA_T mqtt;
+
+static char log_line[128];
+static char server_data[128];
 
 #define CH1_RANGE 8
 int ch1_pins[CH1_RANGE] = {0, 1, 3, 6, 7, 8, 9, 10};
@@ -31,7 +52,7 @@ uint16_t raw_ch2 = 1;
 
 absolute_time_t base_time;
 uint32_t last_adc_read = 0;
-absolute_time_t last_flush;
+// absolute_time_t last_flush;
 
 static bool sd_mounted = false;
 static bool logging_active = false;
@@ -80,6 +101,72 @@ void read_range(void)
     range_selector2();
 }
 
+// led blink functions -----
+bool led_blink_callback(repeating_timer_t *t)
+{
+    static bool led_on = false;
+
+    switch (current_led_state)
+    {
+    case LED_BOOT:
+    case LED_WIFI_CONNECTING:
+    case LED_MQTT_CONNECTING:
+        led_on = !led_on;
+        cyw43_arch_gpio_put(LED_PIN, led_on);
+        break;
+
+    case LED_CONNECTED:
+        cyw43_arch_gpio_put(LED_PIN, 1); // solid ON
+        break;
+
+    case LED_LOGGING:
+        // handled manually during write
+        break;
+    }
+    return true;
+}
+
+void update_led_behavior()
+{
+    cancel_repeating_timer(&led_timer);
+    int interval_ms = 500;
+
+    switch (current_led_state)
+    {
+    case LED_BOOT:
+        interval_ms = 200;
+        add_repeating_timer_ms(-interval_ms, led_blink_callback, NULL, &led_timer);
+        break;
+
+    case LED_WIFI_CONNECTING:
+        interval_ms = 200;
+        add_repeating_timer_ms(-interval_ms, led_blink_callback, NULL, &led_timer);
+        break;
+
+    case LED_MQTT_CONNECTING:
+        interval_ms = 400;
+        add_repeating_timer_ms(-interval_ms, led_blink_callback, NULL, &led_timer);
+        break;
+
+    case LED_CONNECTED:
+        cyw43_arch_gpio_put(LED_PIN, 1); // solid ON (ready to log)
+        break;
+
+    case LED_LOGGING:
+        cyw43_arch_gpio_put(LED_PIN, 0); // normally OFF
+        break;
+    }
+}
+
+static repeating_timer_t write_led_timer;
+bool write_led_off_cb(repeating_timer_t *t)
+{
+    cyw43_arch_gpio_put(LED_PIN, 0);
+    return false; // one-shot
+}
+
+// ---------- Logging control ----------
+
 static void start_logging_file(const char *name)
 {
     if (!sd_mounted)
@@ -107,11 +194,13 @@ static void start_logging_file(const char *name)
     sd_logger_flush(&logger);
 
     base_time = get_absolute_time();
-    last_flush = get_absolute_time();
+    // last_flush = get_absolute_time();
     last_adc_read = time_us_32();
     logging_active = true;
 
     printf("[LOG] Started logging to %s\n", current_filename);
+    current_led_state = LED_LOGGING;
+    update_led_behavior();
 }
 
 static void stop_logging_file(void)
@@ -124,6 +213,8 @@ static void stop_logging_file(void)
     logging_active = false;
     current_filename[0] = '\0';
     printf("[LOG] Logging stopped and file closed.\n");
+    current_led_state = (mqtt_connected ? LED_CONNECTED : LED_MQTT_CONNECTING);
+    update_led_behavior();
 }
 
 // ---------- MQTT message handler ----------
@@ -152,17 +243,31 @@ void mqtt_message_handler(const char *topic, const char *payload)
 int main()
 {
     stdio_init_all();
-    sleep_ms(8000);
-    printf("Knownsense system starting up...\n");
+    // pico_set_program_stack_limit(0x2000);
+    // watchdog_enable(10000, 1); // 10 s watchdog
+
+    sleep_ms(7000);
+    printf("Knownsense [K01] starting...\n");
+    // cyw43_arch_gpio_put(LED_PIN, 0);
+    // current_led_state = LED_BOOT;
+    // update_led_behavior();
 
     // Initialize WiFi
     if (cyw43_arch_init())
         panic("WiFi init failed");
-    cyw43_arch_enable_sta_mode();
-    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, 30000))
-        panic("WiFi connect failed");
 
-    printf("Connected to WiFi: %s\n", WIFI_SSID);
+    cyw43_arch_enable_sta_mode();
+
+    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, 30000))
+    {
+        printf("Wi-Fi failed!\n");
+    }
+    else
+    {
+        printf("Connected to WiFi: %s\n", WIFI_SSID);
+        current_led_state = LED_MQTT_CONNECTING;
+        update_led_behavior();
+    }
 
     // Mount SD card once at startup
     printf("[SD] Mounting SD card...\n");
@@ -199,15 +304,22 @@ int main()
     adc_gpio_init(27);
 
     // MQTT init
+
     mqtt_client_init(&mqtt, "K01");
     mqtt.on_message = mqtt_message_handler;
     mqtt_client_start(&mqtt);
+
+    if (mqtt_connected)
+        current_led_state = LED_CONNECTED;
+    else
+        current_led_state = LED_MQTT_CONNECTING;
+    update_led_behavior();
 
     char buffer[3] = {0};
     int buf_idx = 0;
 
     base_time = get_absolute_time();
-    last_flush = get_absolute_time();
+    // last_flush = get_absolute_time();
     last_adc_read = time_us_32();
 
     while (true)
@@ -235,7 +347,7 @@ int main()
                 int m = ((elapsed_us / 1000000) % 3600) / 60;
                 int s = (elapsed_us / 1000000) % 60;
 
-                char log_line[256];
+                // char log_line[256];
                 snprintf(log_line, sizeof(log_line),
                          "%02d:%02d:%02d,%u,%d,%.3f,%.1f,%u,%d,%.3f,%.1f,%u,%.2f\r\n",
                          h, m, s,
@@ -246,22 +358,48 @@ int main()
                 printf("%s", log_line);
 
                 sd_logger_write(&logger, log_line);
+                // brief ON blink when data is written
+                // non-blocking: set LED on then schedule it off in 80 ms
+                cyw43_arch_gpio_put(LED_PIN, 1);
+                cancel_repeating_timer(&write_led_timer);
+                add_repeating_timer_ms(-80, write_led_off_cb, NULL, &write_led_timer);
+                sd_logger_flush(&logger);
 
-                char server_data[128];
+                // char server_data[128];
                 snprintf(server_data, sizeof(server_data),
                          "%02d:%02d:%02d,%d,%.3f,%.1f,%d,%.3f,%.1f,%.2f",
                          h, m, s,
                          current_range1, voltage_ext1, resistance1,
                          current_range2, voltage_ext2, resistance2,
                          temperature);
-                mqtt_client_publish_resistance(&mqtt, server_data);
+                if (mqtt_connected)
+                    mqtt_client_publish_resistance_safe(&mqtt, server_data);
+                // mqtt_client_publish_resistance(&mqtt, server_data);
 
-                if (absolute_time_diff_us(last_flush, get_absolute_time()) > 2000000)
-                {
-                    sd_logger_flush(&logger);
-                    last_flush = get_absolute_time();
-                    printf("[SD] Data flushed.\n");
-                }
+                // static absolute_time_t last_maint = 0;
+                // if (absolute_time_diff_us(last_maint, get_absolute_time()) > 1000000)
+                // {
+                //     sys_check_timeouts();
+                //     last_maint = get_absolute_time();
+                // }
+
+                mqtt_client_maintenance(&mqtt);
+                //     static absolute_time_t last_maintenance = 0;
+
+                // if (absolute_time_diff_us(last_maintenance, get_absolute_time()) > 10 * 1000000)
+                // {
+                //     mqtt_client_maintenance(&mqtt);
+                //     last_maintenance = get_absolute_time();
+                // }
+
+                //-----------------------------------
+
+                // if (absolute_time_diff_us(last_flush, get_absolute_time()) > 1000000)
+                // {
+                //     sd_logger_flush(&logger);
+                //     last_flush = get_absolute_time();
+                //     printf("[SD] Data flushed.\n");
+                // }
 
                 last_adc_read = now;
             }
@@ -314,6 +452,23 @@ int main()
                 memset(buffer, 0, sizeof(buffer));
             }
         }
+
+        // --- LED state monitor ---
+        led_state_t new_state = current_led_state;
+        if (logging_active)
+            new_state = LED_LOGGING;
+        else if (mqtt_connected)
+            new_state = LED_CONNECTED;
+        else
+            new_state = LED_MQTT_CONNECTING;
+
+        if (new_state != current_led_state)
+        {
+            current_led_state = new_state;
+            update_led_behavior();
+        }
+        // watchdog_update();
+        // tight_loop_contents();
 
         sleep_ms(5);
     }

@@ -28,7 +28,9 @@ FRESULT sd_mount(void)
 // Open a file for logging
 FRESULT sd_logger_open(sd_logger_t *logger, const char *filename)
 {
-    FRESULT fr = f_open(&logger->file, filename, FA_WRITE | FA_CREATE_ALWAYS);
+
+    // FRESULT fr = f_open(&logger->file, filename, FA_WRITE | FA_CREATE_ALWAYS);
+    FRESULT fr = f_open(&logger->file, filename, FA_OPEN_APPEND | FA_WRITE | FA_OPEN_ALWAYS);
     if (fr == FR_OK)
     {
         logger->is_open = true;
@@ -52,6 +54,7 @@ FRESULT sd_logger_write(sd_logger_t *logger, const char *msg)
     if (fr != FR_OK)
     {
         printf("[SD] Write error: %d\n", fr);
+        f_sync(&logger->file); // attempt to flush on error
         return fr;
     }
     return FR_OK;

@@ -29,10 +29,17 @@ typedef struct
     void (*on_message)(const char *topic, const char *payload);
 } MQTT_CLIENT_DATA_T;
 
+extern volatile bool mqtt_connected;
+
 void mqtt_client_init(MQTT_CLIENT_DATA_T *state, const char *client_id);
 void mqtt_client_start(MQTT_CLIENT_DATA_T *state);
 void mqtt_client_publish_temperature(MQTT_CLIENT_DATA_T *state);
 void mqtt_client_publish_resistance(MQTT_CLIENT_DATA_T *state, char msg[128]);
+void mqtt_client_publish_resistance_safe(MQTT_CLIENT_DATA_T *state, const char *msg);
 void mqtt_client_stop(MQTT_CLIENT_DATA_T *state);
+void mqtt_client_maintenance(MQTT_CLIENT_DATA_T *state);
+
+// ✅ Optional helper
+bool mqtt_client_isconnected(MQTT_CLIENT_DATA_T *state);
 
 #endif
