@@ -210,7 +210,7 @@ DSTATUS disk_initialize(BYTE pdrv)
 	}
 
 	// speed up SPI to 1 MHz (you can increase later)
-	spi_init(SPI_PORT, 500 * 1000);
+	spi_init(SPI_PORT, 300 * 1000);
 
 	printf("disk_initialize OK, cdv=%u, sectors=%lu, capacity=%.2f MB\n",
 		   cdv, card_sectors, (card_sectors / 2048.0));

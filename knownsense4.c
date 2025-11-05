@@ -29,8 +29,8 @@ static repeating_timer_t led_timer;
 // ---------- Config / Globals ----------
 MQTT_CLIENT_DATA_T mqtt;
 
-static char log_line[128];
-static char server_data[128];
+static char log_line[256];
+static char server_data[256];
 
 #define CH1_RANGE 8
 int ch1_pins[CH1_RANGE] = {0, 1, 3, 6, 7, 8, 9, 10};
@@ -305,7 +305,7 @@ int main()
 
     // MQTT init
 
-    mqtt_client_init(&mqtt, "K01");
+    mqtt_client_init(&mqtt, "K06");
     mqtt.on_message = mqtt_message_handler;
     mqtt_client_start(&mqtt);
 
