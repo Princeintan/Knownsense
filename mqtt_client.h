@@ -25,6 +25,8 @@ typedef struct
     bool connect_done;
     int subscribe_count;
     bool stop_client;
+    uint32_t next_reconnect_ms;
+    bool connecting;
 
     void (*on_message)(const char *topic, const char *payload);
 } MQTT_CLIENT_DATA_T;
@@ -39,7 +41,8 @@ void mqtt_client_publish_resistance_safe(MQTT_CLIENT_DATA_T *state, const char *
 void mqtt_client_stop(MQTT_CLIENT_DATA_T *state);
 void mqtt_client_maintenance(MQTT_CLIENT_DATA_T *state);
 
-// ✅ Optional helper
+int mqtt_client_get_inflight(void);
+
 bool mqtt_client_isconnected(MQTT_CLIENT_DATA_T *state);
 
 #endif

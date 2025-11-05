@@ -7,6 +7,11 @@
 #include "pico/time.h"
 #include "pico/cyw43_arch.h"
 #include "mqtt_client.h"
+#include "lwip/stats.h"
+#include "lwip/memp.h"
+
+static uint32_t last_health_ms = 0;
+extern struct stats_ lwip_stats;
 
 //---- led init and timer ----
 #define LED_PIN CYW43_WL_GPIO_LED_PIN // Built-in LED on Pico W / Pico 2 W
@@ -52,7 +57,7 @@ uint16_t raw_ch2 = 1;
 
 absolute_time_t base_time;
 uint32_t last_adc_read = 0;
-// absolute_time_t last_flush;
+absolute_time_t last_flush;
 
 static bool sd_mounted = false;
 static bool logging_active = false;
@@ -194,7 +199,7 @@ static void start_logging_file(const char *name)
     sd_logger_flush(&logger);
 
     base_time = get_absolute_time();
-    // last_flush = get_absolute_time();
+    last_flush = get_absolute_time();
     last_adc_read = time_us_32();
     logging_active = true;
 
@@ -239,18 +244,70 @@ void mqtt_message_handler(const char *topic, const char *payload)
     }
 }
 
+static inline uint32_t ms_since_boot_u32(void)
+{
+    return to_ms_since_boot(get_absolute_time());
+}
+
+void print_health(void)
+{
+    uint32_t uptime_s = ms_since_boot_u32() / 1000u;
+
+    // Always print basic info
+    printf("[HEALTH] up=%lus | mqtt_connected=%d | inflight=%d\n",
+           uptime_s, mqtt_connected, mqtt_client_get_inflight());
+
+    // ----- HEAP (lwIP MEM) -----
+#if defined(LWIP_STATS) && LWIP_STATS && defined(MEM_STATS) && MEM_STATS
+    extern struct stats_ lwip_stats;
+    printf("         lwIP heap: used=%u free=%u max=%u err=%u\n",
+           (unsigned)lwip_stats.mem.used,
+           (unsigned)lwip_stats.mem.avail,
+           (unsigned)lwip_stats.mem.max,
+           (unsigned)lwip_stats.mem.err);
+#else
+    // printf("         lwIP heap: (MEM_STATS disabled)\n");
+#endif
+
+    // ----- PBUF POOL & TCP SEGMENT POOL (memp[]) -----
+#if defined(LWIP_STATS) && LWIP_STATS && defined(MEMP_STATS) && MEMP_STATS
+    {
+        extern struct stats_ lwip_stats;
+
+        // In your build, memp[] entries are struct stats_mem*
+        const struct stats_mem *pbuf_stats = lwip_stats.memp[MEMP_PBUF_POOL];
+        const struct stats_mem *tcpseg_stats = lwip_stats.memp[MEMP_TCP_SEG];
+
+        if (pbuf_stats)
+        {
+            printf("         PBUF_POOL: used=%u free=%u max=%u err=%u\n",
+                   (unsigned)pbuf_stats->used,
+                   (unsigned)pbuf_stats->avail,
+                   (unsigned)pbuf_stats->max,
+                   (unsigned)pbuf_stats->err);
+        }
+
+        if (tcpseg_stats)
+        {
+            printf("         TCP_SEG  : used=%u free=%u max=%u err=%u\n",
+                   (unsigned)tcpseg_stats->used,
+                   (unsigned)tcpseg_stats->avail,
+                   (unsigned)tcpseg_stats->max,
+                   (unsigned)tcpseg_stats->err);
+        }
+    }
+#else
+    // printf("         memp stats: (MEMP_STATS disabled)\n");
+#endif
+}
+
 // ---------- Main ----------
 int main()
 {
     stdio_init_all();
-    // pico_set_program_stack_limit(0x2000);
-    // watchdog_enable(10000, 1); // 10 s watchdog
 
     sleep_ms(7000);
     printf("Knownsense [K01] starting...\n");
-    // cyw43_arch_gpio_put(LED_PIN, 0);
-    // current_led_state = LED_BOOT;
-    // update_led_behavior();
 
     // Initialize WiFi
     if (cyw43_arch_init())
@@ -319,11 +376,20 @@ int main()
     int buf_idx = 0;
 
     base_time = get_absolute_time();
-    // last_flush = get_absolute_time();
+    last_flush = get_absolute_time();
     last_adc_read = time_us_32();
 
     while (true)
     {
+        if (to_ms_since_boot(get_absolute_time()) - last_health_ms > 10000)
+        {
+            if (stdio_usb_connected())
+            {
+                print_health();
+            }
+            last_health_ms = to_ms_since_boot(get_absolute_time());
+        }
+
         if (logging_active)
         {
             read_range();
@@ -355,17 +421,17 @@ int main()
                          raw_ch2, current_range2, voltage_ext2, resistance2,
                          raw_temp, temperature);
 
-                printf("%s", log_line);
+                if (stdio_usb_connected())
+                {
+                    printf("%s", log_line);
+                }
 
                 sd_logger_write(&logger, log_line);
-                // brief ON blink when data is written
-                // non-blocking: set LED on then schedule it off in 80 ms
                 cyw43_arch_gpio_put(LED_PIN, 1);
                 cancel_repeating_timer(&write_led_timer);
                 add_repeating_timer_ms(-80, write_led_off_cb, NULL, &write_led_timer);
                 sd_logger_flush(&logger);
 
-                // char server_data[128];
                 snprintf(server_data, sizeof(server_data),
                          "%02d:%02d:%02d,%d,%.3f,%.1f,%d,%.3f,%.1f,%.2f",
                          h, m, s,
@@ -374,84 +440,59 @@ int main()
                          temperature);
                 if (mqtt_connected)
                     mqtt_client_publish_resistance_safe(&mqtt, server_data);
-                // mqtt_client_publish_resistance(&mqtt, server_data);
-
-                // static absolute_time_t last_maint = 0;
-                // if (absolute_time_diff_us(last_maint, get_absolute_time()) > 1000000)
-                // {
-                //     sys_check_timeouts();
-                //     last_maint = get_absolute_time();
-                // }
-
-                mqtt_client_maintenance(&mqtt);
-                //     static absolute_time_t last_maintenance = 0;
-
-                // if (absolute_time_diff_us(last_maintenance, get_absolute_time()) > 10 * 1000000)
-                // {
-                //     mqtt_client_maintenance(&mqtt);
-                //     last_maintenance = get_absolute_time();
-                // }
-
-                //-----------------------------------
-
-                // if (absolute_time_diff_us(last_flush, get_absolute_time()) > 1000000)
-                // {
-                //     sd_logger_flush(&logger);
-                //     last_flush = get_absolute_time();
-                //     printf("[SD] Data flushed.\n");
-                // }
 
                 last_adc_read = now;
             }
         }
+        mqtt_client_maintenance(&mqtt);
 
         // Serial input non-blocking manual range override
-        int c = getchar_timeout_us(0);
-        if (c != PICO_ERROR_TIMEOUT)
-        {
-            if ((c >= '0' && c <= '9') && buf_idx < 2)
-            {
-                buffer[buf_idx++] = (char)c;
-            }
-            else if (c == '\n' && buf_idx > 0)
-            {
-                buffer[buf_idx] = '\0';
-                int ch = buffer[0] - '0';
-                int range = (buf_idx > 1) ? (buffer[1] - '0') : -1;
+        // int c = getchar_timeout_us(0);
+        // if (c != PICO_ERROR_TIMEOUT)
+        // {
+        //     if ((c >= '0' && c <= '9') && buf_idx < 2)
+        //     {
+        //         buffer[buf_idx++] = (char)c;
+        //     }
+        //     else if (c == '\n' && buf_idx > 0)
+        //     {
+        //         buffer[buf_idx] = '\0';
+        //         int ch = buffer[0] - '0';
+        //         int range = (buf_idx > 1) ? (buffer[1] - '0') : -1;
 
-                if (ch == 1 && range >= 1 && range <= CH1_RANGE)
-                {
-                    for (int i = 0; i < CH1_RANGE; i++)
-                        gpio_put(ch1_pins[i], 0);
-                    gpio_put(ch1_pins[range - 1], 1);
-                    current_range1 = range;
-                    printf("Channel 1 -> GPIO %d HIGH\n", ch1_pins[range - 1]);
-                }
-                else if (ch == 2 && range >= 1 && range <= CH2_RANGE)
-                {
-                    for (int i = 0; i < CH2_RANGE; i++)
-                        gpio_put(ch2_pins[i], 0);
-                    gpio_put(ch2_pins[range - 1], 1);
-                    current_range2 = range;
-                    printf("Channel 2 -> GPIO %d HIGH\n", ch2_pins[range - 1]);
-                }
-                else if (ch == 0)
-                {
-                    for (int i = 0; i < CH1_RANGE; i++)
-                        gpio_put(ch1_pins[i], 0);
-                    for (int i = 0; i < CH2_RANGE; i++)
-                        gpio_put(ch2_pins[i], 0);
-                    printf("All GPIOs LOW\n");
-                }
-                buf_idx = 0;
-                memset(buffer, 0, sizeof(buffer));
-            }
-            else
-            {
-                buf_idx = 0;
-                memset(buffer, 0, sizeof(buffer));
-            }
-        }
+        //         if (ch == 1 && range >= 1 && range <= CH1_RANGE)
+        //         {
+        //             for (int i = 0; i < CH1_RANGE; i++)
+        //                 gpio_put(ch1_pins[i], 0);
+        //             gpio_put(ch1_pins[range - 1], 1);
+        //             current_range1 = range;
+        //             printf("Channel 1 -> GPIO %d HIGH\n", ch1_pins[range - 1]);
+        //         }
+        //         else if (ch == 2 && range >= 1 && range <= CH2_RANGE)
+        //         {
+        //             for (int i = 0; i < CH2_RANGE; i++)
+        //                 gpio_put(ch2_pins[i], 0);
+        //             gpio_put(ch2_pins[range - 1], 1);
+        //             current_range2 = range;
+        //             printf("Channel 2 -> GPIO %d HIGH\n", ch2_pins[range - 1]);
+        //         }
+        //         else if (ch == 0)
+        //         {
+        //             for (int i = 0; i < CH1_RANGE; i++)
+        //                 gpio_put(ch1_pins[i], 0);
+        //             for (int i = 0; i < CH2_RANGE; i++)
+        //                 gpio_put(ch2_pins[i], 0);
+        //             printf("All GPIOs LOW\n");
+        //         }
+        //         buf_idx = 0;
+        //         memset(buffer, 0, sizeof(buffer));
+        //     }
+        //     else
+        //     {
+        //         buf_idx = 0;
+        //         memset(buffer, 0, sizeof(buffer));
+        //     }
+        // }
 
         // --- LED state monitor ---
         led_state_t new_state = current_led_state;
@@ -467,10 +508,8 @@ int main()
             current_led_state = new_state;
             update_led_behavior();
         }
-        // watchdog_update();
-        // tight_loop_contents();
 
-        sleep_ms(5);
+        sleep_ms(10);
     }
 
     // cleanup (never reached normally)

@@ -32,9 +32,12 @@ set(PICO_BOARD pico2_w CACHE STRING "Board type")
 include(pico_sdk_import.cmake)
 
 project(knownsense4 C CXX ASM)
-set(MQTT_SERVER "192.168.61.57")
-set(WIFI_SSID "IISERTVM")
-set(WIFI_PASSWORD "iisertvmwlan")
+set(MQTT_SERVER "192.168.137.100")
+set(WIFI_SSID "RCB")
+set(WIFI_PASSWORD "esaalcupnamde")
+
+# set(WIFI_SSID "IISERTVM")
+# set(WIFI_PASSWORD "iisertvmwlan")
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
@@ -116,6 +119,9 @@ target_compile_definitions(knownsense4 PRIVATE
     WIFI_SSID=\"${WIFI_SSID}\"
     WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
     MQTT_SERVER=\"${MQTT_SERVER}\"
+    PICO_STDIO_USB_STDOUT_TIMEOUT_US=2000 # 2 ms max wait on write
+    PICO_STDIO_USB_LOW_PRIORITY_IRQ=1 # move USB IRQs off the tight path
+    PICO_STDIO_DEFAULT_CRLF=1
 )
 
 if(EXISTS "${MQTT_CERT_PATH}/${MQTT_CERT_INC}")
