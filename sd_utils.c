@@ -78,3 +78,39 @@ void sd_logger_close(sd_logger_t *logger)
         printf("[SD] File closed.\n");
     }
 }
+
+bool sd_read_text(const char *path, char *buf, size_t buflen)
+{
+    if (!buf || buflen < 2)
+        return false;
+
+    FIL fp;
+    FRESULT fr = f_open(&fp, path, FA_READ);
+    if (fr != FR_OK)
+    {
+        printf("[SD] Open read failed '%s': %d\n", path, fr);
+        return false;
+    }
+
+    UINT total = 0;
+    for (;;)
+    {
+        if (total + 1 >= buflen)
+            break; // leave room for NUL
+        UINT chunk = (UINT)((buflen - 1) - total);
+        UINT br = 0;
+        fr = f_read(&fp, buf + total, chunk, &br);
+        if (fr != FR_OK)
+        {
+            printf("[SD] Read error '%s': %d\n", path, fr);
+            f_close(&fp);
+            return false;
+        }
+        if (br == 0)
+            break; // EOF
+        total += br;
+    }
+    buf[total] = '\0';
+    f_close(&fp);
+    return true;
+}

@@ -32,12 +32,13 @@ set(PICO_BOARD pico2_w CACHE STRING "Board type")
 include(pico_sdk_import.cmake)
 
 project(knownsense4 C CXX ASM)
-set(MQTT_SERVER "192.168.137.100")
-set(WIFI_SSID "RCB")
-set(WIFI_PASSWORD "esaalcupnamde")
+set(MQTT_SERVER "192.168.61.57")
+set(WIFI_SSID "IISERTVM")
+set(WIFI_PASSWORD "iisertvmwlan")
+set(DEVICE_NAME "K02" CACHE STRING "Default MQTT device/client id")
 
-# set(WIFI_SSID "IISERTVM")
-# set(WIFI_PASSWORD "iisertvmwlan")
+# set(WIFI_SSID "RCB")
+# set(WIFI_PASSWORD "esaalcupnamde")
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
@@ -79,6 +80,7 @@ endif()
 # Add executable. Default name is the project name, version 0.1
 add_executable(knownsense4
     knownsense4.c
+    config.c
     ff.c
     ffsystem.c
     diskio.c
@@ -119,10 +121,16 @@ target_compile_definitions(knownsense4 PRIVATE
     WIFI_SSID=\"${WIFI_SSID}\"
     WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
     MQTT_SERVER=\"${MQTT_SERVER}\"
-    PICO_STDIO_USB_STDOUT_TIMEOUT_US=2000 # 2 ms max wait on write
-    PICO_STDIO_USB_LOW_PRIORITY_IRQ=1 # move USB IRQs off the tight path
-    PICO_STDIO_DEFAULT_CRLF=1
+    DEVICE_NAME=\"${DEVICE_NAME}\"
 )
+
+# PICO_STDIO_USB_STDOUT_TIMEOUT_US=2000
+# PICO_STDIO_USB_LOW_PRIORITY_IRQ=1
+# PICO_STDIO_DEFAULT_CRLF=1
+if(NOT DEFINED DEVICE_NAME AND DEFINED ENV{DEVICE_NAME})
+    set(DEVICE_NAME "$ENV{DEVICE_NAME}" CACHE STRING "Default MQTT device/client id" FORCE)
+    message(STATUS "Using DEVICE_NAME from environment ('${DEVICE_NAME}')")
+endif()
 
 if(EXISTS "${MQTT_CERT_PATH}/${MQTT_CERT_INC}")
     target_compile_definitions(knownsense4 PRIVATE
@@ -135,7 +143,7 @@ if(EXISTS "${MQTT_CERT_PATH}/${MQTT_CERT_INC}")
 endif()
 
 if(MQTT_USERNAME AND MQTT_PASSWORD)
-    target_compile_definitions(picow_mqtt_client PRIVATE
+    target_compile_definitions(knownsense4 PRIVATE
         MQTT_USERNAME=\"${MQTT_USERNAME}\"
         MQTT_PASSWORD=\"${MQTT_PASSWORD}\"
     )

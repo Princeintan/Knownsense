@@ -40,6 +40,10 @@ void mqtt_client_publish_resistance(MQTT_CLIENT_DATA_T *state, char msg[128]);
 void mqtt_client_publish_resistance_safe(MQTT_CLIENT_DATA_T *state, const char *msg);
 void mqtt_client_stop(MQTT_CLIENT_DATA_T *state);
 void mqtt_client_maintenance(MQTT_CLIENT_DATA_T *state);
+bool mqtt_client_publish_topic(MQTT_CLIENT_DATA_T *state,
+                               const char *subtopic,
+                               const char *payload,
+                               int retain);
 
 int mqtt_client_get_inflight(void);
 

@@ -310,6 +310,48 @@ void mqtt_client_publish_resistance_safe(MQTT_CLIENT_DATA_T *state, const char *
         printf("[MQTT] Publish failed (err=%d)\n", err);
 }
 
+bool mqtt_client_publish_topic(MQTT_CLIENT_DATA_T *state,
+                               const char *subtopic,
+                               const char *payload,
+                               int retain)
+{
+    if (!mqtt_client_isconnected(state))
+        return false;
+
+    if (mqtt_inflight_count >= MQTT_MAX_INFLIGHT)
+    {
+        INFO_printf("[MQTT] Skipping publish to %s, inflight=%d\n",
+                    subtopic, mqtt_inflight_count);
+        return false;
+    }
+
+    char topic[64];
+    snprintf(topic, sizeof(topic), "/%s/%s",
+             state->mqtt_client_info.client_id, subtopic);
+
+    cyw43_arch_lwip_begin();
+    err_t err = mqtt_publish(state->mqtt_client_inst,
+                             topic,
+                             payload,
+                             strlen(payload),
+                             MQTT_PUBLISH_QOS,
+                             retain ? 1 : 0,
+                             pub_request_cb,
+                             state);
+    cyw43_arch_lwip_end();
+
+    if (err == ERR_OK)
+    {
+        mqtt_inflight_count++;
+        return true;
+    }
+    else
+    {
+        ERROR_printf("[MQTT] publish to %s failed (err=%d)\n", topic, err);
+        return false;
+    }
+}
+
 void mqtt_client_stop(MQTT_CLIENT_DATA_T *state)
 {
     if (!state || !state->mqtt_client_inst)

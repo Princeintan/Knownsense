@@ -209,7 +209,7 @@ DSTATUS disk_initialize(BYTE pdrv)
 		card_sectors = (blocknr * block_len) / 512;
 	}
 
-	// speed up SPI to 1 MHz (you can increase later)
+	// speed up SPI to 1 MHz
 	spi_init(SPI_PORT, 300 * 1000);
 
 	printf("disk_initialize OK, cdv=%u, sectors=%lu, capacity=%.2f MB\n",
