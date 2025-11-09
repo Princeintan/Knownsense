@@ -18,6 +18,62 @@ static device_config_t cfg;
 
 static uint64_t last_health_ms = 0;
 extern struct stats_ lwip_stats;
+static uint32_t day_count = 0; // cumulative days since user started logging
+static uint32_t sod_start = 0; // seconds-of-day at (this) boot start
+
+// ---- Policy knobs (no dynamic memory anywhere) ----
+#define LOG_ROLL_ROWS 10000u        // lines/file
+#define NET_RETRY_WINDOW_MS 120000u // reboot if MQTT down this long
+
+// small per-boot jitter (0..999 ms) to spread reboot timing
+static inline uint32_t reboot_jitter_ms(void)
+{
+    return (uint32_t)(time_us_32() % 1000u);
+}
+
+#define WIFI_RETRY_PERIOD_MS 10000u  // Wi-Fi retry cadence
+#define AUTOLOG_FILE_PATH "AUTO.TXT" // must satisfy 5-char + .TXT/.CSV rule
+
+static uint32_t log_line_count = 0;
+static uint8_t file_index = 1; // 01..99
+static char base3[4] = "LOG";  // exactly 3 chars + NUL
+static char ext3[4] = "CSV";   // "CSV" or "TXT" (fixed)
+
+static uint64_t last_mqtt_ok_ms = 0;
+static uint64_t last_wifi_retry_ms = 0;
+
+static inline void sanitize_base3_from_payload(const char *p)
+{
+    // take first 3 alnum, uppercase
+    int k = 0;
+    for (; *p && k < 3; ++p)
+    {
+        char c = *p;
+        if ((c >= 'a' && c <= 'z'))
+            c -= 32;
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+            base3[k++] = c;
+    }
+    while (k < 3)
+        base3[k++] = 'L'; // pad if too short
+    base3[3] = '\0';
+}
+
+// ABC01.CSV — always 12 bytes incl NUL
+static inline void build_filename(char out[13])
+{
+    // base3 + 2 digits
+    out[0] = base3[0];
+    out[1] = base3[1];
+    out[2] = base3[2];
+    out[3] = (char)('0' + (file_index / 10));
+    out[4] = (char)('0' + (file_index % 10));
+    out[5] = '.';
+    out[6] = ext3[0];
+    out[7] = ext3[1];
+    out[8] = ext3[2];
+    out[9] = '\0';
+}
 
 //---- led init and timer ----
 #define LED_PIN CYW43_WL_GPIO_LED_PIN // Built-in LED on Pico W / Pico 2 W
@@ -96,7 +152,7 @@ static void publish_health_now(void)
              mu, pu, tu);
 
     // telemetry topic: /<device>/health (retain=0)
-    mqtt_client_publish_topic(&mqtt, "health", js, 0);
+    mqtt_client_publish_topic(&mqtt, "health", js, 1);
 }
 
 static void publish_leak_alert(unsigned mu, unsigned dmu,
@@ -113,7 +169,7 @@ static void publish_leak_alert(unsigned mu, unsigned dmu,
              mu, dmu, pu, dpu, tu, dtu);
 
     // alert topic: /<device>/alert (retain=0)
-    mqtt_client_publish_topic(&mqtt, "alert", js, 0);
+    mqtt_client_publish_topic(&mqtt, "alert", js, 1);
 }
 
 // ---------- Helpers ----------
@@ -223,53 +279,196 @@ bool write_led_off_cb(repeating_timer_t *t)
 }
 
 // ---------- Logging control ----------
+static bool save_autolog_marker(void)
+{
+    FIL f;
+    if (f_open(&f, AUTOLOG_FILE_PATH, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
+        return false;
+    char buf[64];
+    // base=ABC\nidx=01\next=CSV\nday=123\nsod=456\n
+    UINT n;
+    int len = snprintf(buf, sizeof(buf),
+                       "base=%c%c%c\nidx=%02u\next=%c%c%c\nday=%u\nsod=%u\n",
+                       base3[0], base3[1], base3[2], (unsigned)file_index,
+                       ext3[0], ext3[1], ext3[2],
+                       (unsigned)day_count, (unsigned)sod_start);
+    FRESULT fr = f_write(&f, buf, (UINT)len, &n);
+    f_close(&f);
+    return (fr == FR_OK && n == (UINT)len);
+}
 
-static void start_logging_file(const char *name)
+static void clear_autolog_marker(void) { f_unlink(AUTOLOG_FILE_PATH); }
+
+static bool load_autolog_marker(void)
+{
+    FIL f;
+    if (f_open(&f, AUTOLOG_FILE_PATH, FA_READ) != FR_OK)
+        return false;
+
+    char line[32];
+    char b0 = 'L', b1 = 'O', b2 = 'G';
+    unsigned idx = 1, dtmp = 0, sod = 0;
+    char e0 = 'C', e1 = 'S', e2 = 'V';
+
+    while (f_gets(line, sizeof(line), &f))
+    {
+        if (sscanf(line, "base=%c%c%c", &b0, &b1, &b2) == 3)
+        {
+        }
+        else if (sscanf(line, "idx=%u", &idx) == 1)
+        {
+        }
+        else if (sscanf(line, "ext=%c%c%c", &e0, &e1, &e2) == 3)
+        {
+        }
+        else if (sscanf(line, "day=%u", &dtmp) == 1)
+        {
+        }
+        else if (sscanf(line, "sod=%u", &sod) == 1)
+        {
+        }
+    }
+    f_close(&f);
+
+    if (idx == 0 || idx > 99)
+        idx = 1;
+
+    base3[0] = b0;
+    base3[1] = b1;
+    base3[2] = b2;
+    base3[3] = '\0';
+    ext3[0] = e0;
+    ext3[1] = e1;
+    ext3[2] = e2;
+    ext3[3] = '\0';
+    file_index = (uint8_t)idx;
+    day_count = dtmp; // persist days across reboot
+    sod_start = sod;  // seconds-of-day continuity across reboot
+    return true;
+}
+
+// watch dog -----
+#define WD_MAGIC 0x4B4E4F57u
+static inline void wd_set(int i, uint32_t v) { watchdog_hw->scratch[i] = v; }
+static inline uint32_t wd_get(int i) { return watchdog_hw->scratch[i]; }
+static void wd_store_state(bool was_logging, const char *curr_fn)
+{
+    wd_set(0, WD_MAGIC);
+    wd_set(1, (was_logging ? 1u : 0u) | ((uint32_t)file_index << 8));
+    wd_set(2, (uint32_t)log_line_count);
+    // pack curr_fn (<= 9 bytes incl NUL; we store 9 safely in 3 regs)
+    char fn[9] = {0};
+    for (int i = 0; i < 8 && curr_fn[i]; ++i)
+        fn[i] = curr_fn[i]; // "ABC01.CSV"
+    wd_set(3, (uint32_t)fn[0] | ((uint32_t)fn[1] << 8) | ((uint32_t)fn[2] << 16) | ((uint32_t)fn[3] << 24));
+    wd_set(4, (uint32_t)fn[4] | ((uint32_t)fn[5] << 8) | ((uint32_t)fn[6] << 16) | ((uint32_t)fn[7] << 24));
+    wd_set(5, (uint32_t)fn[8]);
+    // base3 + ext3 for completeness
+    wd_set(6, (uint32_t)base3[0] | ((uint32_t)base3[1] << 8) | ((uint32_t)base3[2] << 16) | ((uint32_t)ext3[0] << 24));
+    wd_set(7, (uint32_t)ext3[1] | ((uint32_t)ext3[2] << 8));
+}
+static void wd_clear_state(void)
+{
+    for (int i = 0; i < 8; ++i)
+        wd_set(i, 0);
+}
+static bool wd_load_state(bool *was_logging, char *fn_out /*>=10*/)
+{
+    if (wd_get(0) != WD_MAGIC)
+        return false;
+    uint32_t f1 = wd_get(1);
+    *was_logging = (f1 & 1u) != 0;
+    file_index = (uint8_t)((f1 >> 8) & 0xFF);
+    log_line_count = wd_get(2);
+    uint32_t w3 = wd_get(3), w4 = wd_get(4), w5 = wd_get(5), w6 = wd_get(6), w7 = wd_get(7);
+    fn_out[0] = w3 & 0xFF;
+    fn_out[1] = (w3 >> 8) & 0xFF;
+    fn_out[2] = (w3 >> 16) & 0xFF;
+    fn_out[3] = (w3 >> 24) & 0xFF;
+    fn_out[4] = w4 & 0xFF;
+    fn_out[5] = (w4 >> 8) & 0xFF;
+    fn_out[6] = (w4 >> 16) & 0xFF;
+    fn_out[7] = (w4 >> 24) & 0xFF;
+    fn_out[8] = w5 & 0xFF;
+    fn_out[9] = '\0';
+    base3[0] = w6 & 0xFF;
+    base3[1] = (w6 >> 8) & 0xFF;
+    base3[2] = (w6 >> 16) & 0xFF;
+    ext3[0] = (w6 >> 24) & 0xFF;
+    ext3[1] = w7 & 0xFF;
+    ext3[2] = (w7 >> 8) & 0xFF;
+    base3[3] = ext3[3] = '\0';
+    wd_clear_state();
+    return true;
+}
+
+static bool open_new_log_file(void)
+{
+    build_filename(current_filename);
+    FRESULT fr = sd_logger_open(&logger, current_filename); // create new file handle
+    if (fr != FR_OK)
+    {
+        printf("[LOG] open failed: %s fr=%d\n", current_filename, fr);
+        return false;
+    }
+    static const char *csv_header =
+        "Day,Timestamp,ADC0_raw,Range1,Voltage1(V),Resistance1,ADC1_raw,Range2,Voltage2(V),Resistance2,Temp_raw,Temperature(C)\r\n";
+
+    sd_logger_write(&logger, csv_header);
+    sd_logger_flush(&logger);
+    log_line_count = 0;
+    wd_store_state(true, current_filename);
+    printf("[LOG] Started %s\n", current_filename);
+    return true;
+}
+static inline void close_current_log_file(void)
+{
+    sd_logger_flush(&logger);
+    sd_logger_close(&logger);
+}
+
+static void start_logging_file(const char *payload_base)
 {
     if (!sd_mounted)
     {
         printf("[SD] SD card not mounted! Cannot start logging.\n");
         return;
     }
-
     if (logging_active)
     {
         printf("[LOG] Already logging to %s\n", current_filename);
         return;
     }
-    char base[32];
-    size_t n = 0;
-    for (const char *p = name; *p && n < sizeof(base) - 1; ++p)
+
+    // optional sanitize from payload into base3 (3 chars)
+    if (payload_base && *payload_base)
+        sanitize_base3_from_payload(payload_base);
+
+    // choose the next free index (01..99)
+    for (uint8_t tries = 0; tries < 99; ++tries)
     {
-        char c = *p;
-        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '\"' || c == '<' || c == '>' || c == '|')
-            continue;
-        base[n++] = c;
+        char cand[13];
+        build_filename(cand);
+        FILINFO fi;
+        if (f_stat(cand, &fi) != FR_OK)
+            break; // free slot
+        if (file_index < 99)
+            ++file_index;
+        else
+            file_index = 1;
     }
-    base[n] = '\0';
-    if (base[0] == '\0')
-        strncpy(base, "LOG", sizeof(base));
-
-    snprintf(current_filename, sizeof(current_filename), "%.8s.CSV", base);
-
-    if (sd_logger_open(&logger, current_filename) != FR_OK)
-    {
-        printf("[LOG] File open failed: %s\n", current_filename);
+    if (!open_new_log_file())
         return;
-    }
-
-    const char *csv_header = "Timestamp,ADC0_raw,Range1,Voltage1(V),Resistance1,ADC1_raw,Range2,Voltage2(V),Resistance2,Temp_raw,Temperature(C)\r\n";
-    sd_logger_write(&logger, csv_header);
-    sd_logger_flush(&logger);
 
     base_time = get_absolute_time();
     last_flush = get_absolute_time();
     last_adc_read = time_us_32();
     logging_active = true;
 
-    printf("[LOG] Started logging to %s\n", current_filename);
     current_led_state = LED_LOGGING;
     update_led_behavior();
+
+    (void)save_autolog_marker(); // persist intent so we auto-resume
 }
 
 static void stop_logging_file(void)
@@ -277,10 +476,12 @@ static void stop_logging_file(void)
     if (!logging_active)
         return;
 
-    sd_logger_flush(&logger);
-    sd_logger_close(&logger);
+    close_current_log_file();
     logging_active = false;
     current_filename[0] = '\0';
+    wd_clear_state();
+    clear_autolog_marker(); // explicit stop cancels autostart
+
     printf("[LOG] Logging stopped and file closed.\n");
     current_led_state = (mqtt_connected ? LED_CONNECTED : LED_MQTT_CONNECTING);
     update_led_behavior();
@@ -295,9 +496,27 @@ void mqtt_message_handler(const char *topic, const char *payload)
     if (strcmp(verb, "log") == 0)
     {
         if (strcmp(payload, "0") == 0)
+        {
             stop_logging_file();
+        }
         else
+        {
+            if (strstr(payload, ":TXT"))
+            {
+                ext3[0] = 'T';
+                ext3[1] = 'X';
+                ext3[2] = 'T';
+            }
+            else
+            {
+                ext3[0] = 'C';
+                ext3[1] = 'S';
+                ext3[2] = 'V';
+            }
+
+            // Sanitize base (first 3 A-Z0-9) inside start_logging_file()
             start_logging_file(payload);
+        }
     }
     else if (strcmp(verb, "cmd") == 0)
     {
@@ -400,6 +619,30 @@ int main()
 
     watchdog_disable();
 
+    // If marker exists do autostart. WD-only (without marker) means user had stopped logging, so do NOT auto-resume.
+
+    bool wd_was_logging = false;
+    char wd_fn[10] = {0};
+    bool have_wd = wd_load_state(&wd_was_logging, wd_fn) && wd_was_logging;
+    bool have_marker = load_autolog_marker(); // loads base3/ext3 & file_index
+
+    if (have_marker)
+    {
+        // To avoid appending partial lines after a WD reset: start a NEW rolled file
+        if (have_wd)
+        {
+            if (file_index < 99)
+                ++file_index;
+            else
+                file_index = 1;
+        }
+        start_logging_file(NULL); // base3/ext3/index already set
+    }
+
+    // Network health baseline
+    last_mqtt_ok_ms = to_ms_since_boot(get_absolute_time());
+    last_wifi_retry_ms = last_mqtt_ok_ms; // start the retry window from now
+
     if (cyw43_arch_wifi_connect_timeout_ms(cfg.wifi_ssid, cfg.wifi_password, CYW43_AUTH_WPA2_AES_PSK, 40000))
     {
         printf("Wi-Fi failed!\n");
@@ -466,7 +709,7 @@ int main()
     while (true)
     {
         uint64_t now_ms = to_ms_since_boot(get_absolute_time());
-        if (now_ms - last_health_ms > 10000)
+        if (now_ms - last_health_ms > 30000)
         {
             if (stdio_usb_connected())
             {
@@ -488,8 +731,9 @@ int main()
                     unsigned dpu = pu - leak_base.pbuf_used;
                     unsigned dtu = tu - leak_base.tcpseg_used;
 
-                    printf("[LEAK?] mem=%u(+%u) pbuf=%u(+%u) tcpseg=%u(+%u)\n",
-                           mu, dmu, pu, dpu, tu, dtu);
+                    if (stdio_usb_connected())
+                        printf("[LEAK?] mem=%u(+%u) pbuf=%u(+%u) tcpseg=%u(+%u)\n",
+                               mu, dmu, pu, dpu, tu, dtu);
 
                     publish_leak_alert(mu, dmu, pu, dpu, tu, dtu);
 
@@ -519,16 +763,34 @@ int main()
                 uint16_t raw_temp = adc_read();
                 float voltage_temp = (raw_temp * VREF) / (1 << 12);
                 float temperature = 27.0f - (voltage_temp - 0.706f) / 0.001721f;
-
+                // -- formating elapsed time --
                 int64_t elapsed_us = absolute_time_diff_us(base_time, get_absolute_time());
-                int h = (elapsed_us / 1000000) / 3600;
-                int m = ((elapsed_us / 1000000) % 3600) / 60;
-                int s = (elapsed_us / 1000000) % 60;
+                uint32_t elapsed_s = (uint32_t)(elapsed_us / 1000000u);
 
-                // char log_line[256];
+                // Add elapsed to persisted start-of-day
+                uint32_t total_s = sod_start + elapsed_s;
+                uint32_t days_add = total_s / 86400u;
+                uint32_t sod = total_s % 86400u;
+
+                // If we crossed a day boundary since last loop, bump day_count and reduce sod_start
+                if (days_add > 0)
+                {
+                    day_count += days_add;
+                    // Move the reference so elapsed stays small and precise
+                    sod_start = sod;                 // carry remainder as new start-of-day
+                    base_time = get_absolute_time(); // reset base for small elapsed
+                }
+
+                // Format h:m:s from 'sod'
+                int h = (int)(sod / 3600u);
+                int m = (int)((sod % 3600u) / 60u);
+                int s = (int)(sod % 60u);
+
+                // --- formating elevated time done ---
+
                 snprintf(log_line, sizeof(log_line),
-                         "%02d:%02d:%02d,%u,%d,%.3f,%.1f,%u,%d,%.3f,%.1f,%u,%.2f\r\n",
-                         h, m, s,
+                         "%u,%02d:%02d:%02d,%u,%d,%.3f,%.1f,%u,%d,%.3f,%.1f,%u,%.2f\r\n",
+                         (unsigned)day_count, h, m, s,
                          raw_ch1, current_range1, voltage_ext1, resistance1,
                          raw_ch2, current_range2, voltage_ext2, resistance2,
                          raw_temp, temperature);
@@ -539,12 +801,49 @@ int main()
                 }
 
                 sd_logger_write(&logger, log_line);
+                // COUNT + PERSIST ON FLUSH
+                log_line_count++;
+
                 if (absolute_time_diff_us(last_flush, get_absolute_time()) >
                     (int64_t)cfg.log_flush_s * 1000000)
                 {
                     sd_logger_flush(&logger);
                     last_flush = get_absolute_time();
+
+                    // Refresh WD resume info & marker only on flush boundary (wear-safe)
+                    wd_store_state(true, current_filename);
+                    (void)save_autolog_marker();
                 }
+
+                // ROLL AFTER N ROWS
+                if (log_line_count >= LOG_ROLL_ROWS)
+                {
+                    close_current_log_file();
+                    if (file_index < 99)
+                        ++file_index;
+                    else
+                        file_index = 1;
+
+                    if (!open_new_log_file())
+                    {
+                        // Fail-safe: stop logging to avoid data loss if we can't open next file
+                        logging_active = false;
+                        current_filename[0] = '\0';
+                        wd_clear_state();
+                        clear_autolog_marker();
+                        printf("[LOG] Rolling failed; logging stopped.\n");
+                        current_led_state = (mqtt_connected ? LED_CONNECTED : LED_MQTT_CONNECTING);
+                        update_led_behavior();
+                    }
+                    else
+                    {
+                        base_time = get_absolute_time(); // optional: restart elapsed clock per file
+                        last_flush = get_absolute_time();
+                        last_adc_read = now;
+                        (void)save_autolog_marker();
+                    }
+                }
+
                 cyw43_arch_gpio_put(LED_PIN, 1);
                 (void)cancel_repeating_timer(&write_led_timer);
                 add_repeating_timer_ms(-80, write_led_off_cb, NULL, &write_led_timer);
@@ -562,6 +861,31 @@ int main()
             }
         }
         mqtt_client_maintenance(&mqtt);
+        // --- NETWORK SELF-HEAL ---
+        if (mqtt_connected)
+        {
+            last_mqtt_ok_ms = now_ms;
+        }
+        else
+        {
+            if (now_ms - last_wifi_retry_ms > WIFI_RETRY_PERIOD_MS)
+            {
+                last_wifi_retry_ms = now_ms;
+                (void)cyw43_arch_wifi_connect_timeout_ms(
+                    cfg.wifi_ssid, cfg.wifi_password, CYW43_AUTH_WPA2_AES_PSK, 3000);
+            }
+            if (now_ms - last_mqtt_ok_ms > (NET_RETRY_WINDOW_MS + reboot_jitter_ms()))
+            {
+                printf("[NET] MQTT down > %u ms, rebooting to recover...\n", (unsigned)NET_RETRY_WINDOW_MS);
+                (void)save_autolog_marker();
+                wd_store_state(logging_active, current_filename);
+                sleep_ms(50);
+                watchdog_reboot(0, 0, 0);
+                while (1)
+                { /* wait */
+                }
+            }
+        }
 
         // --- LED state monitor ---
         led_state_t new_state = current_led_state;
