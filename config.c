@@ -116,6 +116,13 @@ void config_init_defaults(device_config_t *cfg)
     cfg->log_flush_s = 1; // default 1 second flush
     cfg->cfg_version = 1;
 
+    // after existing cfg fields
+    cfg->heater_enabled = 0;      // disabled by default
+    cfg->heater_pwm_pin = 2;      // GP2
+    cfg->heater_tc_cs_pin = 5;    // GP5
+    cfg->heater_control_mode = 1; // PI by default
+    cfg->heater_target_c = 25.0f; // 25.0 °C default  // default 25.0 C
+
     /* copy to module current config */
     memcpy(&current_cfg, cfg, sizeof(*cfg));
 }
@@ -154,13 +161,36 @@ bool config_load(device_config_t *cfg, const char *path)
         tmp.log_flush_s = (uint8_t)u;
     if (json_get_uint(json_buf, "cfg_version", &u))
         tmp.cfg_version = (uint8_t)u;
-
+    /* heater fields */
+    if (json_get_uint(json_buf, "heater_enabled", &u))
+        tmp.heater_enabled = (uint8_t)u;
+    if (json_get_uint(json_buf, "heater_pwm_pin", &u))
+        tmp.heater_pwm_pin = (uint8_t)u;
+    if (json_get_uint(json_buf, "heater_tc_cs_pin", &u))
+        tmp.heater_tc_cs_pin = (uint8_t)u;
+    if (json_get_uint(json_buf, "heater_control_mode", &u))
+        tmp.heater_control_mode = (uint8_t)u;
+    {
+        const char *k = strstr(json_buf, "\"heater_target\"");
+        if (k)
+        {
+            const char *p = strchr(k, ':');
+            if (p)
+            {
+                float ft = 0.0f;
+                if (sscanf(p + 1, "%f", &ft) == 1)
+                {
+                    tmp.heater_target_c = ft;
+                }
+            }
+        }
+    }
     /* commit parsed values */
     memcpy(cfg, &tmp, sizeof(tmp));
     memcpy(&current_cfg, &tmp, sizeof(tmp));
-
-    printf("[CFG] Loaded %s v%u (dev=%s, broker=%s, sample_ms=%ums, flush=%us)\n",
-           path, (unsigned)tmp.cfg_version, tmp.device_name, tmp.broker_ip, (unsigned)tmp.sample_ms, (unsigned)tmp.log_flush_s);
+    printf("[CFG] Loaded %s v%u (dev=%s, broker=%s, sample_ms=%ums, flush=%us) heater_en=%u target=%.1fC\n",
+           path, (unsigned)tmp.cfg_version, tmp.device_name, tmp.broker_ip, (unsigned)tmp.sample_ms, (unsigned)tmp.log_flush_s,
+           (unsigned)tmp.heater_enabled, tmp.heater_target_c);
 
     return true;
 }

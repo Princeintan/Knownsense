@@ -2,12 +2,9 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-#include <stdbool.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stddef.h>
-
-/* Pico SDK also provides fixed-width types; this helps some IntelliSense setups */
-#include "pico/types.h"
 
 #include "sd_utils.h" // for sd_read_text()
 
@@ -30,6 +27,12 @@ extern "C"
         uint32_t sample_ms;  // ADC sample period in ms (runtime override)
         uint8_t log_flush_s; // log flush interval seconds
         uint8_t cfg_version; // schema version
+
+        uint8_t heater_enabled;      // 0 = disabled, 1 = enabled
+        uint8_t heater_pwm_pin;      // PWM output pin (default GP2)
+        uint8_t heater_tc_cs_pin;    // TC chip-select pin (default GP5)
+        uint8_t heater_control_mode; // 0 = ON/OFF, 1 = PI
+        float heater_target_c;       // target temperature in °C
     } device_config_t;
 
     /* Initialize config struct with compile-time defaults (DEVICE_NAME, WIFI_SSID, etc.) */

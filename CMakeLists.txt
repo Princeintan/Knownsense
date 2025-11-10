@@ -85,6 +85,7 @@ add_executable(knownsense
     ffsystem.c
     diskio.c
     sd_utils.c
+    heater.c
     mqtt_client.c
 )
 
@@ -97,14 +98,17 @@ else()
 endif()
 
 pico_set_program_name(knownsense "knownsense")
-pico_set_program_version(knownsense "0.1")
+pico_set_program_version(knownsense "0.2")
 
 # Modify the below lines to enable/disable output over UART/USB
 
 # Add the standard library to the build
 target_link_libraries(knownsense
     pico_stdlib
+    pico_sync
+    hardware_pwm
     hardware_adc
+    hardware_spi
     pico_cyw43_arch_lwip_threadsafe_background
     pico_lwip_mqtt
     pico_mbedtls
@@ -149,9 +153,6 @@ if(MQTT_USERNAME AND MQTT_PASSWORD)
     )
 endif()
 
-# Add any user requested libraries
-target_link_libraries(knownsense hardware_spi
-)
 pico_enable_stdio_uart(knownsense 0)
 pico_enable_stdio_usb(knownsense 1)
 pico_add_extra_outputs(knownsense)

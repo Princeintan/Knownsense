@@ -1,8 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "pico/stdlib.h"
 #include "hardware/adc.h"
+#include "hardware/pwm.h"
+#include "pico/mutex.h"
 #include "sd_utils.h"
 #include "pico/time.h"
 #include "pico/cyw43_arch.h"
@@ -10,10 +13,12 @@
 #include "lwip/stats.h"
 #include "lwip/memp.h"
 #include "config.h"
+#include "heater.h"
 #include "hardware/watchdog.h"
 
 //---------- Config ----------
 static device_config_t cfg;
+static mutex_t spi_mutex;
 // ---------- Globals ----------
 
 static uint64_t last_health_ms = 0;
@@ -41,6 +46,8 @@ static char ext3[4] = "CSV";   // "CSV" or "TXT" (fixed)
 
 static uint64_t last_mqtt_ok_ms = 0;
 static uint64_t last_wifi_retry_ms = 0;
+static uint64_t last_heater_ms = 0;
+const uint32_t HEATER_PERIOD_MS = 500;
 
 static inline void sanitize_base3_from_payload(const char *p)
 {
@@ -518,6 +525,20 @@ void mqtt_message_handler(const char *topic, const char *payload)
             start_logging_file(payload);
         }
     }
+    else if (strcmp(verb, "set") == 0)
+    {
+        float v = strtof(payload, NULL);
+        if (!isnan(v))
+        {
+            heater_set_target_c(v);
+            printf("[MQTT SET] heater target set to %.2f C via MQTT\n", v);
+        }
+        else
+        {
+            printf("[MQTT SET] unrecognized payload: '%s'\n", payload);
+        }
+    }
+
     else if (strcmp(verb, "cmd") == 0)
     {
         printf("[MQTT CMD] %s\n", payload);
@@ -604,6 +625,7 @@ int main()
             sleep_ms(1000);
     }
     sd_mounted = true;
+
     // load_config_from_sd(&cfg);
     device_config_t cfg_local;
     config_init_defaults(&cfg_local);
@@ -616,6 +638,16 @@ int main()
         cfg_local.log_flush_s = 1;
 
     memcpy(&cfg, &cfg_local, sizeof(cfg));
+
+    // initialize SPI mutex and register with heater module
+    mutex_init(&spi_mutex);
+    heater_register_spi_mutex(&spi_mutex);
+
+    // initialize heater if enabled by configuration
+    if (cfg.heater_enabled)
+    {
+        heater_init_if_enabled(cfg.heater_pwm_pin, cfg.heater_tc_cs_pin, cfg.heater_control_mode, cfg.heater_target_c);
+    }
 
     watchdog_disable();
 
@@ -900,6 +932,12 @@ int main()
         {
             current_led_state = new_state;
             update_led_behavior();
+        }
+
+        if (now_ms - last_heater_ms >= HEATER_PERIOD_MS)
+        {
+            last_heater_ms = now_ms;
+            heater_update_periodic(HEATER_PERIOD_MS);
         }
         watchdog_update();
 
