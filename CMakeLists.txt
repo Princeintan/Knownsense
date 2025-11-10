@@ -31,7 +31,7 @@ set(PICO_BOARD pico2_w CACHE STRING "Board type")
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
-project(knownsense4 C CXX ASM)
+project(knownsense C CXX ASM)
 set(MQTT_SERVER "192.168.61.57")
 set(WIFI_SSID "IISERTVM")
 set(WIFI_PASSWORD "iisertvmwlan")
@@ -78,8 +78,8 @@ if(NOT MQTT_CERT_INC)
 endif()
 
 # Add executable. Default name is the project name, version 0.1
-add_executable(knownsense4
-    knownsense4.c
+add_executable(knownsense
+    knownsense.c
     config.c
     ff.c
     ffsystem.c
@@ -89,20 +89,20 @@ add_executable(knownsense4
 )
 
 if(COMMAND pico_set_stack_size)
-    pico_set_stack_size(knownsense4 0x4000)
+    pico_set_stack_size(knownsense 0x4000)
 else()
     # Fallback: define the __stack_size symbol for the linker if pico_set_stack_size is not available
     # Use linker defsym to set the stack size for GCC toolchains
-    target_link_options(knownsense4 PRIVATE "-Wl,--defsym=__stack_size=0x4000")
+    target_link_options(knownsense PRIVATE "-Wl,--defsym=__stack_size=0x4000")
 endif()
 
-pico_set_program_name(knownsense4 "knownsense4")
-pico_set_program_version(knownsense4 "0.1")
+pico_set_program_name(knownsense "knownsense")
+pico_set_program_version(knownsense "0.1")
 
 # Modify the below lines to enable/disable output over UART/USB
 
 # Add the standard library to the build
-target_link_libraries(knownsense4
+target_link_libraries(knownsense
     pico_stdlib
     hardware_adc
     pico_cyw43_arch_lwip_threadsafe_background
@@ -112,12 +112,12 @@ target_link_libraries(knownsense4
 )
 
 # Add the standard include files to the build
-target_include_directories(knownsense4 PRIVATE
+target_include_directories(knownsense PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/..
 )
 
-target_compile_definitions(knownsense4 PRIVATE
+target_compile_definitions(knownsense PRIVATE
     WIFI_SSID=\"${WIFI_SSID}\"
     WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
     MQTT_SERVER=\"${MQTT_SERVER}\"
@@ -133,28 +133,28 @@ if(NOT DEFINED DEVICE_NAME AND DEFINED ENV{DEVICE_NAME})
 endif()
 
 if(EXISTS "${MQTT_CERT_PATH}/${MQTT_CERT_INC}")
-    target_compile_definitions(knownsense4 PRIVATE
+    target_compile_definitions(knownsense PRIVATE
         MQTT_CERT_INC=\"${MQTT_CERT_INC}\"
         ALTCP_MBEDTLS_AUTHMODE=MBEDTLS_SSL_VERIFY_REQUIRED
     )
-    target_include_directories(knownsense4 PRIVATE
+    target_include_directories(knownsense PRIVATE
         ${MQTT_CERT_PATH}
     )
 endif()
 
 if(MQTT_USERNAME AND MQTT_PASSWORD)
-    target_compile_definitions(knownsense4 PRIVATE
+    target_compile_definitions(knownsense PRIVATE
         MQTT_USERNAME=\"${MQTT_USERNAME}\"
         MQTT_PASSWORD=\"${MQTT_PASSWORD}\"
     )
 endif()
 
 # Add any user requested libraries
-target_link_libraries(knownsense4 hardware_spi
+target_link_libraries(knownsense hardware_spi
 )
-pico_enable_stdio_uart(knownsense4 0)
-pico_enable_stdio_usb(knownsense4 1)
-pico_add_extra_outputs(knownsense4)
+pico_enable_stdio_uart(knownsense 0)
+pico_enable_stdio_usb(knownsense 1)
+pico_add_extra_outputs(knownsense)
 
 set_source_files_properties(
     ${PICO_LWIP_PATH}/src/apps/altcp_tls/altcp_tls_mbedtls.c
