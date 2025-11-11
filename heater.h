@@ -26,3 +26,9 @@ void heater_force_off(void);
 
 // Returns true if thermocouple successfully read previously
 bool heater_present_tc(void);
+
+void heater_start(void);
+void heater_stop(void);
+bool heater_running(void);
+bool heater_tc_connected(void);
+float heater_get_temperature_c(void);

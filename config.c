@@ -164,10 +164,10 @@ bool config_load(device_config_t *cfg, const char *path)
     /* heater fields */
     if (json_get_uint(json_buf, "heater_enabled", &u))
         tmp.heater_enabled = (uint8_t)u;
-    if (json_get_uint(json_buf, "heater_pwm_pin", &u))
-        tmp.heater_pwm_pin = (uint8_t)u;
-    if (json_get_uint(json_buf, "heater_tc_cs_pin", &u))
-        tmp.heater_tc_cs_pin = (uint8_t)u;
+    // if (json_get_uint(json_buf, "heater_pwm_pin", &u))
+    //     tmp.heater_pwm_pin = (uint8_t)u;
+    // if (json_get_uint(json_buf, "heater_tc_cs_pin", &u))
+    //     tmp.heater_tc_cs_pin = (uint8_t)u;
     if (json_get_uint(json_buf, "heater_control_mode", &u))
         tmp.heater_control_mode = (uint8_t)u;
     {

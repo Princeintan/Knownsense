@@ -5,6 +5,7 @@
 #include "hardware/spi.h"
 #include <stdio.h>
 #include <math.h>
+#include "pico/time.h"
 
 #ifndef HEATER_PWM_WRAP
 #define HEATER_PWM_WRAP 10000u
@@ -12,7 +13,10 @@
 
 // PI controller constants (tune for your heater)
 static const float PI_KP = 1.2f;
-static const float PI_KI = 0.03f;
+static const float PI_KI = 0.05f;
+
+#define SOFT_START_MS 5000u     // ramp duration after heater_start() (tuneable)
+#define SOFT_START_MAX_PC 30.0f // maximum allowed duty% at start ramp (percent)
 
 static mutex_t *g_spi_mutex = NULL;
 static bool g_initialized = false;
@@ -23,6 +27,15 @@ static float g_target_c = 25.0f;
 static float g_integral = 0.0f;
 static float g_duty_percent = 0.0f;
 static bool g_have_tc = false;
+
+// New: whether the heater control is "armed" (only when true will periodic
+// control compute and apply PWM). Starts false so device remains safe at boot.
+static bool g_running = false;
+
+// Last-read thermocouple temperature cache (NAN when not read/available)
+static float g_last_tc_temp = NAN;
+
+static uint64_t g_start_ms = 0;
 
 void heater_register_spi_mutex(mutex_t *m)
 {
@@ -49,6 +62,8 @@ void heater_init_if_enabled(uint8_t pwm_pin, uint8_t tc_cs_pin, uint8_t control_
     g_integral = 0.0f;
     g_duty_percent = 0.0f;
     g_have_tc = false;
+    g_running = false; // start in stopped state (safe)
+    g_last_tc_temp = NAN;
 
     // Setup TC CS pin (idle high)
     gpio_init(g_tc_cs_pin);
@@ -125,18 +140,58 @@ void heater_update_periodic(uint32_t dt_ms)
     if (!g_initialized)
         return;
 
-    // Read thermocouple
+    // Read thermocouple (always attempt read, so g_have_tc reflects actual state)
     float temp = read_tc_once();
     if (isnan(temp))
     {
-        printf("[HEATER] TC read failed\n");
+        // failed to read tc; mark missing
         g_have_tc = false;
+        g_last_tc_temp = NAN;
+        // If not running, just return quickly
+        if (!g_running)
+        {
+            // ensure PWM remains off
+            if (g_initialized)
+            {
+                uint slice = pwm_gpio_to_slice_num(g_pwm_pin);
+                pwm_set_chan_level(slice, pwm_gpio_to_channel(g_pwm_pin), 0);
+            }
+            return;
+        }
+        // if running but TC read failed, we should be conservative and turn heater off
+        g_running = false;
+        g_integral = 0.0f;
+        g_duty_percent = 0.0f;
+        if (g_initialized)
+        {
+            uint slice = pwm_gpio_to_slice_num(g_pwm_pin);
+            pwm_set_chan_level(slice, pwm_gpio_to_channel(g_pwm_pin), 0);
+        }
+        printf("[HEATER] TC read failed — disarming heater for safety\n");
         return;
     }
-    g_have_tc = true;
-    printf("[HEATER] read temp=%.2f target=%.2f err=%.2f integral=%.2f duty=%.2f\n",
-           temp, g_target_c, g_target_c - temp, g_integral, g_duty_percent);
 
+    // TC read succeeded
+    g_have_tc = true;
+    g_last_tc_temp = temp;
+
+    // Debug/log current reading
+    // printf("[HEATER] read temp=%.2f target=%.2f running=%d integral=%.2f duty=%.2f\n",
+    //        temp, g_target_c, (int)g_running, g_integral, g_duty_percent);
+
+    // If not running, do NOT compute or apply control — only return after read
+    if (!g_running)
+    {
+        // make sure PWM is zero
+        if (g_initialized)
+        {
+            uint slice = pwm_gpio_to_slice_num(g_pwm_pin);
+            pwm_set_chan_level(slice, pwm_gpio_to_channel(g_pwm_pin), 0);
+        }
+        return;
+    }
+
+    // Running: perform control (PI or on/off)
     if (g_control_mode == 1)
     {
         // PI
@@ -148,19 +203,121 @@ void heater_update_periodic(uint32_t dt_ms)
             out = 0.0f;
         if (out > 100.0f)
             out = 100.0f;
+
+        // apply soft-start cap (if recently started)
+        if (g_running && g_start_ms != 0)
+        {
+            uint64_t since = to_ms_since_boot(get_absolute_time()) - g_start_ms;
+            if (since < SOFT_START_MS)
+            {
+                // linear ramp of cap from 0 -> SOFT_START_MAX_PC over SOFT_START_MS
+                float frac = (float)since / (float)SOFT_START_MS;
+                float cap = SOFT_START_MAX_PC * frac;
+                if (out > cap)
+                    out = cap;
+            }
+            else
+            {
+                // ramp finished, clear start marker for slight efficiency
+                g_start_ms = 0;
+            }
+        }
+
         g_duty_percent = out;
     }
     else
     {
         // on/off with hysteresis +/-1°C
+        float out = 0.0f;
         if (temp < g_target_c - 1.0f)
-            g_duty_percent = 100.0f;
+            out = 100.0f;
         else if (temp > g_target_c + 1.0f)
-            g_duty_percent = 0.0f;
+            out = 0.0f;
+
+        // apply soft-start cap same as above
+        if (g_running && g_start_ms != 0)
+        {
+            uint64_t since = to_ms_since_boot(get_absolute_time()) - g_start_ms;
+            if (since < SOFT_START_MS)
+            {
+                float frac = (float)since / (float)SOFT_START_MS;
+                float cap = SOFT_START_MAX_PC * frac;
+                if (out > cap)
+                    out = cap;
+            }
+            else
+            {
+                g_start_ms = 0;
+            }
+        }
+        g_duty_percent = out;
     }
 
     // Apply PWM
-    uint slice = pwm_gpio_to_slice_num(g_pwm_pin);
-    uint level = (uint)((g_duty_percent / 100.0f) * (float)HEATER_PWM_WRAP);
-    pwm_set_chan_level(slice, pwm_gpio_to_channel(g_pwm_pin), level);
+    if (g_initialized)
+    {
+        uint slice = pwm_gpio_to_slice_num(g_pwm_pin);
+        uint level = (uint)((g_duty_percent / 100.0f) * (float)HEATER_PWM_WRAP);
+        pwm_set_chan_level(slice, pwm_gpio_to_channel(g_pwm_pin), level);
+    }
+}
+
+// Start heater control
+void heater_start(void)
+{
+    g_integral = 0.0f; // avoid integral windup causing immediate large output
+    g_duty_percent = 0.0f;
+    g_running = true;
+    g_start_ms = to_ms_since_boot(get_absolute_time());
+    // Debug print
+    printf("[HEATER] START requested: target=%.2f\n", g_target_c);
+}
+
+// Stop heater: disarm controller, clear integral and force PWM off
+void heater_stop(void)
+{
+    g_running = false;
+    g_integral = 0.0f;
+    g_duty_percent = 0.0f;
+    if (g_initialized)
+    {
+        uint slice = pwm_gpio_to_slice_num(g_pwm_pin);
+        pwm_set_chan_level(slice, pwm_gpio_to_channel(g_pwm_pin), 0);
+    }
+    printf("[HEATER] STOP requested: PWM forced off\n");
+}
+
+// Return thermocouple connection state
+bool heater_tc_connected(void)
+{
+    return g_have_tc;
+}
+
+// Get thermocouple temperature (best-effort read); returns NAN on error
+float heater_get_temperature_c(void)
+{
+    // Return last cached temperature if available; try a fresh read otherwise.
+    if (!g_initialized)
+        return NAN;
+
+    if (!isnan(g_last_tc_temp))
+        return g_last_tc_temp;
+
+    // fallback to on-demand read
+    float t = read_tc_once();
+    if (!isnan(t))
+    {
+        g_have_tc = true;
+        g_last_tc_temp = t;
+    }
+    else
+    {
+        g_have_tc = false;
+    }
+    return t;
+}
+
+bool heater_running(void)
+{
+    return g_running;
 }

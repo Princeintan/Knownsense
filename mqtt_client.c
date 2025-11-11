@@ -110,10 +110,10 @@ static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection
         INFO_printf("MQTT connected\n");
 
         // (Re-subscribe as you had)
-        const char *topics[] = {"/log", "/cmd", "/set"};
+        const char *topics[] = {"/log", "/cmd"};
         char topic_with_id[48];
 
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < 2; i++)
         {
             snprintf(topic_with_id, sizeof(topic_with_id), "/%s%s", state->mqtt_client_info.client_id, topics[i]);
 

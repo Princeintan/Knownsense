@@ -25,6 +25,8 @@ static uint64_t last_health_ms = 0;
 extern struct stats_ lwip_stats;
 static uint32_t day_count = 0; // cumulative days since user started logging
 static uint32_t sod_start = 0; // seconds-of-day at (this) boot start
+static float saved_heater_target = NAN;
+static bool saved_heater_running = false;
 
 // ---- Policy knobs (no dynamic memory anywhere) ----
 #define LOG_ROLL_ROWS 10000u        // lines/file
@@ -150,16 +152,90 @@ static void publish_health_now(void)
     unsigned mu = 0, pu = 0, tu = 0;
 #endif
 
-    char js[256];
-    // compact JSON — easy to parse in Node-RED/Grafana/Telegraf
-    snprintf(js, sizeof(js),
-             "{\"up\":%lu,\"mqtt\":%d,\"inflight\":%d,"
-             "\"lwip_mem\":%u,\"pbuf\":%u,\"tcpseg\":%u}",
-             (unsigned long)up_s, mqtt_connected, mqtt_client_get_inflight(),
-             mu, pu, tu);
+    // read battery from ADC2 (GPIO28)
+    adc_select_input(2);
+    uint16_t raw_batt = adc_read();
+    const float VREF = 3.3f;
+    float bat_vadc = (raw_batt * VREF) / (1 << 12);
+    float battery_v = bat_vadc * 2.0f; // 560K/560K divider
 
-    // telemetry topic: /<device>/health (retain=0)
-    mqtt_client_publish_topic(&mqtt, "health", js, 1);
+    // Prepare heater fields according to your rules
+    char heater_tc_frag[64] = {0};      // will contain fragment like: "heater_tc":12.34  OR "heater_tc":"NA" OR "heater_tc":0
+    char heater_running_frag[64] = {0}; // will contain fragment like: "heater_running":25.00 OR "heater_running":"NA" OR "heater_running":0
+
+    if (!cfg.heater_enabled)
+    {
+        // Not heater-capable -> "NA" for both (strings)
+        snprintf(heater_tc_frag, sizeof(heater_tc_frag), "\"heater_tc\":\"NA\"");
+        snprintf(heater_running_frag, sizeof(heater_running_frag), "\"heater_running\":\"NA\"");
+    }
+    else
+    {
+        // Heater capable
+        if (heater_tc_connected())
+        {
+            float tc = heater_get_temperature_c();
+            if (!isnan(tc))
+                snprintf(heater_tc_frag, sizeof(heater_tc_frag), "\"heater_tc\":%.2f", tc);
+            else
+                // defensive: if connected but read returned NAN, treat as 0 per your instruction for 'not connected'
+                snprintf(heater_tc_frag, sizeof(heater_tc_frag), "\"heater_tc\":0");
+        }
+        else
+        {
+            // thermocouple not connected -> numeric 0
+            snprintf(heater_tc_frag, sizeof(heater_tc_frag), "\"heater_tc\":0");
+        }
+
+        // heater_running: if running -> show setpoint, else 0
+        if (heater_running())
+        {
+            float tgt = heater_get_target_c();
+            if (!isnan(tgt))
+                snprintf(heater_running_frag, sizeof(heater_running_frag), "\"heater_running\":%.2f", tgt);
+            else
+                snprintf(heater_running_frag, sizeof(heater_running_frag), "\"heater_running\":0");
+        }
+        else
+        {
+            snprintf(heater_running_frag, sizeof(heater_running_frag), "\"heater_running\":0");
+        }
+    }
+
+    // Prepare logging fragment: numeric 0 or filename string
+    char logging_frag[128] = {0};
+    if (logging_active && current_filename[0] != '\0')
+    {
+        // escape not handled — assume current_filename is safe (your code only creates simple names)
+        snprintf(logging_frag, sizeof(logging_frag), "\"logging\":\"%s\"", current_filename);
+    }
+    else
+    {
+        snprintf(logging_frag, sizeof(logging_frag), "\"logging\":0");
+    }
+
+    // Compose final JSON (battery followed by the three requested fields)
+    char js[512];
+    int n = snprintf(js, sizeof(js),
+                     "{\"up\":%lu,\"mqtt\":%d,\"inflight\":%d,"
+                     "\"lwip_mem\":%u,\"pbuf\":%u,\"tcpseg\":%u,"
+                     "\"battery_v\":%.3f,%s,%s,%s}",
+                     (unsigned long)up_s, mqtt_connected, mqtt_client_get_inflight(),
+                     mu, pu, tu,
+                     battery_v,
+                     heater_tc_frag,
+                     heater_running_frag,
+                     logging_frag);
+
+    if (n > 0 && n < (int)sizeof(js))
+    {
+        mqtt_client_publish_topic(&mqtt, "health", js, 1);
+    }
+    else
+    {
+        // fallback
+        mqtt_client_publish_topic(&mqtt, "health", "{\"up\":0,\"err\":1}", 1);
+    }
 }
 
 static void publish_leak_alert(unsigned mu, unsigned dmu,
@@ -291,7 +367,7 @@ static bool save_autolog_marker(void)
     FIL f;
     if (f_open(&f, AUTOLOG_FILE_PATH, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
         return false;
-    char buf[64];
+    char buf[128];
     // base=ABC\nidx=01\next=CSV\nday=123\nsod=456\n
     UINT n;
     int len = snprintf(buf, sizeof(buf),
@@ -299,6 +375,26 @@ static bool save_autolog_marker(void)
                        base3[0], base3[1], base3[2], (unsigned)file_index,
                        ext3[0], ext3[1], ext3[2],
                        (unsigned)day_count, (unsigned)sod_start);
+
+    // If this is a heater variant, append last setpoint and running flag (0/1)
+    if (cfg.heater_enabled)
+    {
+        float ht = heater_get_target_c();
+        int running = heater_running() ? 1 : 0;
+        if (len < (int)sizeof(buf))
+        {
+            int rem = (int)sizeof(buf) - len;
+            int n = snprintf(buf + len, rem, "heater_target=%.2f\nheater_running=%d\n",
+                             ht, running);
+            if (n > 0)
+            {
+                if (n < rem)
+                    len += n;
+                else
+                    len = sizeof(buf) - 1; // clamp to buffer size-1
+            }
+        }
+    }
     FRESULT fr = f_write(&f, buf, (UINT)len, &n);
     f_close(&f);
     return (fr == FR_OK && n == (UINT)len);
@@ -312,13 +408,18 @@ static bool load_autolog_marker(void)
     if (f_open(&f, AUTOLOG_FILE_PATH, FA_READ) != FR_OK)
         return false;
 
-    char line[32];
+    char line[64];
     char b0 = 'L', b1 = 'O', b2 = 'G';
     unsigned idx = 1, dtmp = 0, sod = 0;
     char e0 = 'C', e1 = 'S', e2 = 'V';
 
+    // reset saved heater values
+    saved_heater_target = NAN;
+    saved_heater_running = false;
+
     while (f_gets(line, sizeof(line), &f))
     {
+        unsigned tmp_running;
         if (sscanf(line, "base=%c%c%c", &b0, &b1, &b2) == 3)
         {
         }
@@ -333,6 +434,13 @@ static bool load_autolog_marker(void)
         }
         else if (sscanf(line, "sod=%u", &sod) == 1)
         {
+        }
+        else if (sscanf(line, "heater_target=%f", &saved_heater_target) == 1)
+        {
+        }
+        else if (sscanf(line, "heater_running=%u", &tmp_running) == 1)
+        {
+            saved_heater_running = (tmp_running != 0);
         }
     }
     f_close(&f);
@@ -349,8 +457,8 @@ static bool load_autolog_marker(void)
     ext3[2] = e2;
     ext3[3] = '\0';
     file_index = (uint8_t)idx;
-    day_count = dtmp; // persist days across reboot
-    sod_start = sod;  // seconds-of-day continuity across reboot
+    day_count = dtmp;
+    sod_start = sod;
     return true;
 }
 
@@ -419,7 +527,7 @@ static bool open_new_log_file(void)
         return false;
     }
     static const char *csv_header =
-        "Day,Timestamp,ADC0_raw,Range1,Voltage1(V),Resistance1,ADC1_raw,Range2,Voltage2(V),Resistance2,Temp_raw,Temperature(C)\r\n";
+        "Day,Timestamp,Range1,Analog1,Resistance1,Range2,Analog2,Resistance2,HeaterTemp,NetworkStatus\r\n";
 
     sd_logger_write(&logger, csv_header);
     sd_logger_flush(&logger);
@@ -486,6 +594,7 @@ static void stop_logging_file(void)
     close_current_log_file();
     logging_active = false;
     current_filename[0] = '\0';
+
     wd_clear_state();
     clear_autolog_marker(); // explicit stop cancels autostart
 
@@ -505,43 +614,72 @@ void mqtt_message_handler(const char *topic, const char *payload)
         if (strcmp(payload, "0") == 0)
         {
             stop_logging_file();
+            publish_health_now();
         }
         else
         {
-            if (strstr(payload, ":TXT"))
-            {
-                ext3[0] = 'T';
-                ext3[1] = 'X';
-                ext3[2] = 'T';
-            }
-            else
-            {
-                ext3[0] = 'C';
-                ext3[1] = 'S';
-                ext3[2] = 'V';
-            }
 
-            // Sanitize base (first 3 A-Z0-9) inside start_logging_file()
+            ext3[0] = 'C';
+            ext3[1] = 'S';
+            ext3[2] = 'V';
+
             start_logging_file(payload);
+            publish_health_now();
         }
     }
-    else if (strcmp(verb, "set") == 0)
-    {
-        float v = strtof(payload, NULL);
-        if (!isnan(v))
-        {
-            heater_set_target_c(v);
-            printf("[MQTT SET] heater target set to %.2f C via MQTT\n", v);
-        }
-        else
-        {
-            printf("[MQTT SET] unrecognized payload: '%s'\n", payload);
-        }
-    }
-
     else if (strcmp(verb, "cmd") == 0)
     {
         printf("[MQTT CMD] %s\n", payload);
+
+        if (cfg.heater_enabled)
+        {
+            // try numeric payload or "set <num>"
+            char *endptr = NULL;
+            float v = strtof(payload, &endptr);
+            if (endptr != payload && !isnan(v))
+            {
+                heater_set_target_c(v);
+                printf("[MQTT CMD] heater target set to %.2f C via CMD\n", v);
+                publish_health_now();
+                return;
+            }
+
+            if (strcasecmp(payload, "heater start") == 0 || strcasecmp(payload, "heater on") == 0)
+            {
+                heater_start();
+                printf("[MQTT CMD] heater start requested\n");
+                publish_health_now();
+                return;
+            }
+            if (strcasecmp(payload, "heater stop") == 0 || strcasecmp(payload, "heater off") == 0)
+            {
+                heater_stop();
+                printf("[MQTT CMD] heater stop requested\n");
+                publish_health_now();
+                return;
+            }
+
+            // try "set x" fallback
+            if (strncmp(payload, "set", 3) == 0)
+            {
+                const char *p = payload + 3;
+                while (*p == ' ' || *p == ':')
+                    p++;
+                float v2 = strtof(p, NULL);
+                if (!isnan(v2))
+                {
+                    heater_set_target_c(v2);
+                    printf("[MQTT CMD] heater target set to %.2f C via CMD(set)\n", v2);
+                    publish_health_now();
+                    return;
+                }
+            }
+        }
+        else
+        {
+            printf("[MQTT CMD] Ignored heater command (heater not enabled): '%s'\n", payload);
+            publish_health_now();
+        }
     }
 }
 
@@ -669,6 +807,24 @@ int main()
                 file_index = 1;
         }
         start_logging_file(NULL); // base3/ext3/index already set
+        if (cfg.heater_enabled)
+        {
+            if (!isnan(saved_heater_target))
+            {
+                heater_set_target_c(saved_heater_target);
+                printf("[BOOT] Restored heater target: %.2f C from %s\n", saved_heater_target, AUTOLOG_FILE_PATH);
+            }
+            if (saved_heater_running)
+            {
+                heater_start();
+                printf("[BOOT] Restored heater running state: START\n");
+            }
+            else
+            {
+                heater_stop();
+                printf("[BOOT] Restored heater running state: STOP\n");
+            }
+        }
     }
 
     // Network health baseline
@@ -709,6 +865,7 @@ int main()
     adc_set_temp_sensor_enabled(true);
     adc_gpio_init(26);
     adc_gpio_init(27);
+    adc_gpio_init(28);
 
     // MQTT init
 
@@ -818,14 +975,47 @@ int main()
                 int m = (int)((sod % 3600u) / 60u);
                 int s = (int)(sod % 60u);
 
-                // --- formating elevated time done ---
+                // --- heater temperature string ---
+                char heater_buf[16];
+                if (cfg.heater_enabled)
+                {
+                    if (heater_tc_connected())
+                    {
+                        float ht = heater_get_temperature_c();
+                        if (!isnan(ht))
+                            snprintf(heater_buf, sizeof(heater_buf), "%.2f", ht);
+                        else
+                            snprintf(heater_buf, sizeof(heater_buf), "nan");
+                    }
+                    else
+                    {
+                        snprintf(heater_buf, sizeof(heater_buf), "open");
+                    }
+                }
+                else
+                {
+                    snprintf(heater_buf, sizeof(heater_buf), "NA");
+                }
 
+                // network_status: 1=all good, 2=mqtt disconnected, 3=wifi disconnected
+                uint32_t now_ms_local = to_ms_since_boot(get_absolute_time());
+                int network_status = 1;
+                if (!mqtt_connected)
+                {
+                    if ((now_ms_local - last_mqtt_ok_ms) < (NET_RETRY_WINDOW_MS / 2))
+                        network_status = 2;
+                    else
+                        network_status = 3;
+                }
+
+                // Compose SD log line:
+                // Day,hh:mm:ss,Range1,Analog1,Resistance1,Range2,Analog2,Resistance2,HeaterTemp,NetworkStatus
                 snprintf(log_line, sizeof(log_line),
-                         "%u,%02d:%02d:%02d,%u,%d,%.3f,%.1f,%u,%d,%.3f,%.1f,%u,%.2f\r\n",
+                         "%u,%02d:%02d:%02d,%d,%u,%.1f,%d,%u,%.1f,%s,%d\r\n",
                          (unsigned)day_count, h, m, s,
-                         raw_ch1, current_range1, voltage_ext1, resistance1,
-                         raw_ch2, current_range2, voltage_ext2, resistance2,
-                         raw_temp, temperature);
+                         current_range1, (unsigned)raw_ch1, resistance1,
+                         current_range2, (unsigned)raw_ch2, resistance2,
+                         heater_buf, network_status);
 
                 if (stdio_usb_connected())
                 {
@@ -880,12 +1070,12 @@ int main()
                 (void)cancel_repeating_timer(&write_led_timer);
                 add_repeating_timer_ms(-80, write_led_off_cb, NULL, &write_led_timer);
 
+                // --- MQTT publish resistance ---
+
                 snprintf(server_data, sizeof(server_data),
-                         "%02d:%02d:%02d,%d,%.3f,%.1f,%d,%.3f,%.1f,%.2f",
-                         h, m, s,
-                         current_range1, voltage_ext1, resistance1,
-                         current_range2, voltage_ext2, resistance2,
-                         temperature);
+                         "%u,%02d:%02d:%02d,%.1f,%.1f,%s",
+                         (unsigned)day_count, h, m, s,
+                         resistance1, resistance2, heater_buf);
                 if (mqtt_connected)
                     mqtt_client_publish_resistance_safe(&mqtt, server_data);
 
@@ -934,7 +1124,7 @@ int main()
             update_led_behavior();
         }
 
-        if (now_ms - last_heater_ms >= HEATER_PERIOD_MS)
+        if (cfg.heater_enabled && now_ms - last_heater_ms >= HEATER_PERIOD_MS)
         {
             last_heater_ms = now_ms;
             heater_update_periodic(HEATER_PERIOD_MS);
